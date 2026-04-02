@@ -1,8 +1,9 @@
 import asyncio
 import json
+import logging
 import os
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -16,8 +17,25 @@ app = FastAPI(title="Anthropic Adapter")
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://litellm:4000/v1").rstrip("/")
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
 ADAPTER_API_KEY = os.getenv("ANTHROPIC_PROXY_API_KEY", "")
+STRICT_SIGNED_THINKING = os.getenv("STRICT_SIGNED_THINKING", "true").strip().lower() in {"1", "true", "yes", "on"}
+ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED = os.getenv("ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED", "true").strip().lower() in {"1", "true", "yes", "on"}
+ALLOW_UNSIGNED_THINKING_USER_AGENTS = [
+    token.strip().lower()
+    for token in os.getenv("ALLOW_UNSIGNED_THINKING_USER_AGENTS", "").split(",")
+    if token.strip()
+]
+FORCE_THINKING_USER_AGENTS = [
+    token.strip().lower()
+    for token in os.getenv("FORCE_THINKING_USER_AGENTS", "claude-cli/2.1.90").split(",")
+    if token.strip()
+]
+FORCE_THINKING_BUDGET_TOKENS = int(os.getenv("FORCE_THINKING_BUDGET_TOKENS", "4096") or 4096)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+LOGGER = logging.getLogger("anthropic_proxy")
 
 
 class UpstreamError(Exception):
@@ -68,6 +86,62 @@ def _validate_adapter_auth(x_api_key: Optional[str], authorization: Optional[str
     candidate = x_api_key or _extract_bearer_token(authorization)
     if candidate != ADAPTER_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _thinking_requested(body: Dict[str, Any]) -> bool:
+    thinking = body.get("thinking")
+    return isinstance(thinking, dict) and thinking.get("type") == "enabled"
+
+
+def _collect_message_content_types(messages: Any) -> List[str]:
+    seen: set[str] = set()
+    if not isinstance(messages, list):
+        return []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            seen.add("text")
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, str):
+                seen.add("text")
+            elif isinstance(block, dict):
+                btype = block.get("type")
+                if isinstance(btype, str) and btype:
+                    seen.add(btype)
+
+    return sorted(seen)
+
+
+def _should_require_signed_thinking(body: Dict[str, Any], user_agent: Optional[str]) -> bool:
+    if not STRICT_SIGNED_THINKING:
+        return False
+
+    if not _thinking_requested(body):
+        return True
+
+    if not ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED:
+        return True
+
+    if not ALLOW_UNSIGNED_THINKING_USER_AGENTS:
+        return False
+
+    ua = (user_agent or "").lower()
+    return not any(token in ua for token in ALLOW_UNSIGNED_THINKING_USER_AGENTS)
+
+
+def _should_force_thinking(body: Dict[str, Any], user_agent: Optional[str]) -> bool:
+    if _thinking_requested(body):
+        return False
+    if not FORCE_THINKING_USER_AGENTS:
+        return False
+    ua = (user_agent or "").lower()
+    return any(token in ua for token in FORCE_THINKING_USER_AGENTS)
 
 
 def _extract_error_message(body: Any) -> str:
@@ -306,15 +380,57 @@ def _safe_json_loads(raw: str) -> Any:
         return {"raw": raw}
 
 
-def _encode_redacted_thinking(text: str) -> Dict[str, str]:
-    payload = {"text": text, "type": "reasoning.text"}
-    packed = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-    import base64
+def _extract_reasoning_blocks(msg: Dict[str, Any], require_signed_thinking: bool) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+    fallback_signature = msg.get("reasoning_signature")
+    if not isinstance(fallback_signature, str):
+        fallback_signature = ""
 
-    return {"type": "redacted_thinking", "data": f"openrouter.reasoning:{base64.b64encode(packed).decode('ascii')}"}
+    def append_thinking(text: Any, signature: Any) -> None:
+        if not isinstance(text, str) or not text.strip():
+            return
+        sig = signature if isinstance(signature, str) else ""
+        if require_signed_thinking and not sig:
+            return
+        blocks.append({"type": "thinking", "thinking": text, "signature": sig})
+
+    def append_redacted(data: Any) -> None:
+        if isinstance(data, str) and data:
+            blocks.append({"type": "redacted_thinking", "data": data})
+
+    def consume(raw: Any, default_signature: str) -> None:
+        if isinstance(raw, str):
+            append_thinking(raw, default_signature)
+            return
+
+        if isinstance(raw, dict):
+            raw_type = raw.get("type")
+            if raw_type in {"redacted_thinking", "reasoning.encrypted", "reasoning.redacted"}:
+                append_redacted(raw.get("data") or raw.get("encrypted") or raw.get("ciphertext"))
+                return
+
+            text_value = raw.get("thinking")
+            if not isinstance(text_value, str):
+                text_value = raw.get("text")
+            append_thinking(text_value, raw.get("signature") or default_signature)
+            return
+
+        if isinstance(raw, list):
+            for item in raw:
+                consume(item, default_signature)
+
+    consume(msg.get("reasoning"), fallback_signature)
+    if not blocks:
+        consume(msg.get("reasoning_content"), fallback_signature)
+
+    return blocks
 
 
-def _openai_to_anthropic_response(openai_resp: Dict[str, Any], model_name: str) -> Dict[str, Any]:
+def _openai_to_anthropic_response(
+    openai_resp: Dict[str, Any],
+    model_name: str,
+    require_signed_thinking: bool,
+) -> Dict[str, Any]:
     choices = openai_resp.get("choices", [])
     if not choices:
         raise HTTPException(status_code=502, detail="Upstream response had no choices")
@@ -323,9 +439,7 @@ def _openai_to_anthropic_response(openai_resp: Dict[str, Any], model_name: str) 
     finish_reason = choices[0].get("finish_reason", "stop")
     content_blocks: List[Dict[str, Any]] = []
 
-    reasoning_text = msg.get("reasoning") or msg.get("reasoning_content")
-    if isinstance(reasoning_text, str) and reasoning_text.strip():
-        content_blocks.append({"type": "thinking", "thinking": reasoning_text, "signature": ""})
+    content_blocks.extend(_extract_reasoning_blocks(msg, require_signed_thinking))
 
     text = msg.get("content")
     if isinstance(text, list):
@@ -352,9 +466,6 @@ def _openai_to_anthropic_response(openai_resp: Dict[str, Any], model_name: str) 
                 "input": _safe_json_loads(fn.get("arguments", "{}")),
             }
         )
-
-    if isinstance(reasoning_text, str) and reasoning_text.strip():
-        content_blocks.append(_encode_redacted_thinking(reasoning_text))
 
     usage = openai_resp.get("usage", {}) or {}
     input_tokens = int(usage.get("prompt_tokens", 0) or 0)
@@ -426,7 +537,472 @@ def _sse(event: str, payload: Dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=True)}\n\n".encode("utf-8")
 
 
-def _stream_events_from_message(msg: Dict[str, Any]) -> Iterable[bytes]:
+def _extract_stream_delta_text(delta: Dict[str, Any]) -> str:
+    content = delta.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _extract_stream_delta_reasoning(delta: Dict[str, Any]) -> Tuple[str, str, str]:
+    thinking_parts: List[str] = []
+    signature = ""
+    redacted_data = ""
+
+    def consume(raw: Any) -> None:
+        nonlocal signature, redacted_data
+
+        if isinstance(raw, str):
+            if raw:
+                thinking_parts.append(raw)
+            return
+
+        if isinstance(raw, dict):
+            raw_type = raw.get("type")
+            if raw_type in {"redacted_thinking", "reasoning.encrypted", "reasoning.redacted"}:
+                candidate = raw.get("data") or raw.get("encrypted") or raw.get("ciphertext")
+                if isinstance(candidate, str) and candidate and not redacted_data:
+                    redacted_data = candidate
+                return
+
+            text = raw.get("thinking")
+            if not isinstance(text, str):
+                text = raw.get("text")
+            if isinstance(text, str) and text:
+                thinking_parts.append(text)
+
+            sig = raw.get("signature")
+            if isinstance(sig, str) and sig and not signature:
+                signature = sig
+            return
+
+        if isinstance(raw, list):
+            for item in raw:
+                consume(item)
+
+    consume(delta.get("reasoning"))
+    if not thinking_parts and not redacted_data:
+        consume(delta.get("reasoning_content"))
+
+    top_sig = delta.get("reasoning_signature")
+    if isinstance(top_sig, str) and top_sig and not signature:
+        signature = top_sig
+
+    return "".join(thinking_parts), signature, redacted_data
+
+
+async def _stream_litellm_to_anthropic(
+    payload: Dict[str, Any],
+    model_name: str,
+    require_signed_thinking: bool,
+) -> AsyncIterator[bytes]:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "Accept-Encoding": "identity",
+        "Cache-Control": "no-cache",
+    }
+    if LITELLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LITELLM_API_KEY}"
+
+    client = _get_http_client()
+    delay = 0.4
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with client.stream(
+                "POST",
+                f"{LITELLM_BASE_URL}/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as resp:
+                if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+                    await resp.aread()
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+
+                if resp.status_code >= 400:
+                    raw = await resp.aread()
+                    try:
+                        body: Any = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        body = {"error": {"message": raw.decode("utf-8", errors="replace"), "code": resp.status_code}}
+                    raise UpstreamError(resp.status_code, body)
+
+                message_id: Optional[str] = None
+                stop_reason = "end_turn"
+                usage: Dict[str, Any] = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": None,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation": None,
+                    "inference_geo": None,
+                    "server_tool_use": None,
+                    "service_tier": None,
+                    "speed": "standard",
+                    "cost": 0,
+                    "is_byok": False,
+                    "cost_details": {
+                        "upstream_inference_cost": 0,
+                        "upstream_inference_prompt_cost": 0,
+                        "upstream_inference_completions_cost": 0,
+                    },
+                }
+
+                next_content_index = 0
+                active_text_index: Optional[int] = None
+                active_thinking_index: Optional[int] = None
+                active_redacted_index: Optional[int] = None
+                pending_thinking_text = ""
+                tool_blocks: Dict[int, Dict[str, Any]] = {}
+                had_tool_calls = False
+                started = False
+                data_lines: List[str] = []
+
+                async def close_text_block() -> AsyncIterator[bytes]:
+                    nonlocal active_text_index
+                    if active_text_index is not None:
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": active_text_index})
+                        active_text_index = None
+
+                async def close_thinking_block() -> AsyncIterator[bytes]:
+                    nonlocal active_thinking_index
+                    if active_thinking_index is not None:
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": active_thinking_index})
+                        active_thinking_index = None
+
+                async def close_redacted_block() -> AsyncIterator[bytes]:
+                    nonlocal active_redacted_index
+                    if active_redacted_index is not None:
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": active_redacted_index})
+                        active_redacted_index = None
+
+                async def emit_from_data(raw_data: str) -> AsyncIterator[bytes]:
+                    nonlocal message_id, stop_reason, usage
+                    nonlocal next_content_index, active_text_index, active_thinking_index, active_redacted_index
+                    nonlocal pending_thinking_text
+                    nonlocal had_tool_calls, started
+
+                    if raw_data == "[DONE]":
+                        return
+
+                    try:
+                        chunk = json.loads(raw_data)
+                    except Exception:
+                        return
+
+                    if not started:
+                        message_id = chunk.get("id") or f"gen-{uuid.uuid4()}"
+                        yield _sse(
+                            "message_start",
+                            {
+                                "type": "message_start",
+                                "message": {
+                                    "id": message_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "container": None,
+                                    "content": [],
+                                    "model": model_name,
+                                    "stop_reason": None,
+                                    "stop_sequence": None,
+                                    "usage": {
+                                        "input_tokens": 0,
+                                        "output_tokens": 0,
+                                        "cache_creation_input_tokens": None,
+                                        "cache_read_input_tokens": None,
+                                        "cache_creation": None,
+                                        "inference_geo": None,
+                                        "server_tool_use": None,
+                                        "service_tier": None,
+                                        "speed": "standard",
+                                    },
+                                    "provider": chunk.get("provider"),
+                                },
+                            },
+                        )
+                        started = True
+
+                    chunk_usage = chunk.get("usage")
+                    if isinstance(chunk_usage, dict):
+                        usage["input_tokens"] = int(chunk_usage.get("prompt_tokens", usage["input_tokens"]) or 0)
+                        usage["output_tokens"] = int(chunk_usage.get("completion_tokens", usage["output_tokens"]) or 0)
+
+                    choices = chunk.get("choices")
+                    if not isinstance(choices, list) or not choices:
+                        return
+
+                    choice0 = choices[0] if isinstance(choices[0], dict) else {}
+                    finish_reason = choice0.get("finish_reason")
+                    if isinstance(finish_reason, str) and finish_reason:
+                        stop_reason = _finish_reason_to_stop_reason(finish_reason, had_tool_calls)
+
+                    delta = choice0.get("delta")
+                    if not isinstance(delta, dict):
+                        return
+
+                    thinking_piece, thinking_signature, redacted_piece = _extract_stream_delta_reasoning(delta)
+                    if (
+                        require_signed_thinking
+                        and active_thinking_index is None
+                        and thinking_signature
+                        and pending_thinking_text
+                    ):
+                        async for event in close_text_block():
+                            yield event
+                        async for event in close_redacted_block():
+                            yield event
+
+                        active_thinking_index = next_content_index
+                        next_content_index += 1
+                        yield _sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": active_thinking_index,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": "",
+                                    "signature": thinking_signature,
+                                },
+                            },
+                        )
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": active_thinking_index,
+                                "delta": {"type": "thinking_delta", "thinking": pending_thinking_text},
+                            },
+                        )
+                        pending_thinking_text = ""
+
+                    if thinking_piece:
+                        if require_signed_thinking and active_thinking_index is None and not thinking_signature:
+                            pending_thinking_text += thinking_piece
+                        else:
+                            async for event in close_text_block():
+                                yield event
+                            async for event in close_redacted_block():
+                                yield event
+
+                            if active_thinking_index is None:
+                                active_thinking_index = next_content_index
+                                next_content_index += 1
+                                yield _sse(
+                                    "content_block_start",
+                                    {
+                                        "type": "content_block_start",
+                                        "index": active_thinking_index,
+                                        "content_block": {"type": "thinking", "thinking": "", "signature": thinking_signature},
+                                    },
+                                )
+
+                            merged_thinking_piece = f"{pending_thinking_text}{thinking_piece}" if pending_thinking_text else thinking_piece
+                            pending_thinking_text = ""
+                            yield _sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": active_thinking_index,
+                                    "delta": {"type": "thinking_delta", "thinking": merged_thinking_piece},
+                                },
+                            )
+
+                    if redacted_piece and pending_thinking_text and active_thinking_index is None:
+                        pending_thinking_text = ""
+
+                    if redacted_piece:
+                        async for event in close_text_block():
+                            yield event
+                        async for event in close_thinking_block():
+                            yield event
+
+                        if active_redacted_index is None:
+                            active_redacted_index = next_content_index
+                            next_content_index += 1
+                            yield _sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": active_redacted_index,
+                                    "content_block": {"type": "redacted_thinking", "data": ""},
+                                },
+                            )
+
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": active_redacted_index,
+                                "delta": {"type": "signature_delta", "signature": redacted_piece},
+                            },
+                        )
+
+                    text_piece = _extract_stream_delta_text(delta)
+                    if text_piece and pending_thinking_text and active_thinking_index is None:
+                        pending_thinking_text = ""
+
+                    if text_piece:
+                        async for event in close_thinking_block():
+                            yield event
+                        async for event in close_redacted_block():
+                            yield event
+
+                        if active_text_index is None:
+                            active_text_index = next_content_index
+                            next_content_index += 1
+                            yield _sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": active_text_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                },
+                            )
+
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": active_text_index,
+                                "delta": {"type": "text_delta", "text": text_piece},
+                            },
+                        )
+
+                    tool_deltas = delta.get("tool_calls")
+                    if isinstance(tool_deltas, list) and tool_deltas and pending_thinking_text and active_thinking_index is None:
+                        pending_thinking_text = ""
+
+                    if isinstance(tool_deltas, list) and tool_deltas:
+                        async for event in close_text_block():
+                            yield event
+                        async for event in close_thinking_block():
+                            yield event
+                        async for event in close_redacted_block():
+                            yield event
+
+                        had_tool_calls = True
+                        for tc in tool_deltas:
+                            if not isinstance(tc, dict):
+                                continue
+                            oai_index = int(tc.get("index", 0) or 0)
+                            block = tool_blocks.get(oai_index)
+
+                            raw_function = tc.get("function")
+                            function: Dict[str, Any] = raw_function if isinstance(raw_function, dict) else {}
+
+                            if block is None:
+                                block = {
+                                    "index": next_content_index,
+                                    "id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                                    "name": function.get("name") or "tool",
+                                }
+                                tool_blocks[oai_index] = block
+                                next_content_index += 1
+
+                                yield _sse(
+                                    "content_block_start",
+                                    {
+                                        "type": "content_block_start",
+                                        "index": block["index"],
+                                        "content_block": {
+                                            "type": "tool_use",
+                                            "id": block["id"],
+                                            "caller": {"type": "direct"},
+                                            "name": block["name"],
+                                            "input": {},
+                                        },
+                                    },
+                                )
+
+                            if tc.get("id"):
+                                block["id"] = tc["id"]
+                            if isinstance(function.get("name"), str) and function.get("name"):
+                                block["name"] = function["name"]
+
+                            arguments_piece = function.get("arguments")
+                            if isinstance(arguments_piece, str) and arguments_piece:
+                                yield _sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": block["index"],
+                                        "delta": {"type": "input_json_delta", "partial_json": arguments_piece},
+                                    },
+                                )
+
+                async for line in resp.aiter_lines():
+                    if line is None:
+                        continue
+
+                    raw_line = line.rstrip("\r")
+                    if raw_line == "":
+                        if data_lines:
+                            raw_data = "\n".join(data_lines)
+                            data_lines = []
+                            async for event in emit_from_data(raw_data):
+                                yield event
+                        continue
+
+                    if raw_line.startswith("data:"):
+                        data_lines.append(raw_line[5:].strip())
+
+                if data_lines:
+                    raw_data = "\n".join(data_lines)
+                    async for event in emit_from_data(raw_data):
+                        yield event
+
+                async for event in close_text_block():
+                    yield event
+                async for event in close_thinking_block():
+                    yield event
+                async for event in close_redacted_block():
+                    yield event
+
+                for block in tool_blocks.values():
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": block["index"]})
+
+                yield _sse(
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {
+                            "container": None,
+                            "stop_reason": stop_reason,
+                            "stop_sequence": None,
+                        },
+                        "usage": usage,
+                    },
+                )
+                yield _sse("message_stop", {"type": "message_stop"})
+                yield b"event: data\ndata: [DONE]\n\n"
+                return
+        except UpstreamError:
+            raise
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
+
+    raise HTTPException(status_code=502, detail="Upstream request failed")
+
+
+def _stream_events_from_message(msg: Dict[str, Any], require_signed_thinking: bool) -> Iterable[bytes]:
     message_start = {
         "type": "message_start",
         "message": {
@@ -457,7 +1033,10 @@ def _stream_events_from_message(msg: Dict[str, Any]) -> Iterable[bytes]:
     for idx, block in enumerate(msg.get("content", [])):
         btype = block.get("type")
         if btype == "thinking":
-            yield _sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+            signature = block.get("signature") if isinstance(block.get("signature"), str) else ""
+            if require_signed_thinking and not signature:
+                continue
+            yield _sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "thinking", "thinking": "", "signature": signature}})
             yield _sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "thinking_delta", "thinking": block.get("thinking", "")}})
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
         elif btype == "text":
@@ -521,14 +1100,48 @@ async def messages(
     authorization: Optional[str] = Header(default=None),
     anthropic_version: Optional[str] = Header(default=None),
     anthropic_beta: Optional[str] = Header(default=None),
+    user_agent: Optional[str] = Header(default=None),
 ) -> Any:
     # Headers kept for Anthropic compatibility; adapter currently ignores version/beta flags.
     _ = anthropic_version
-    _ = anthropic_beta
     _validate_adapter_auth(x_api_key, authorization)
 
     body = await request.json()
     body["model"] = _resolve_model(body.get("model", ""))
+
+    forced_thinking = False
+    if _should_force_thinking(body, user_agent):
+        body["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": FORCE_THINKING_BUDGET_TOKENS,
+        }
+        forced_thinking = True
+
+    request_id = uuid.uuid4().hex[:12]
+    require_signed_thinking = _should_require_signed_thinking(body, user_agent)
+    LOGGER.info(
+        "messages.request %s",
+        json.dumps(
+            {
+                "request_id": request_id,
+                "model": body.get("model"),
+                "stream": bool(body.get("stream")),
+                "thinking_requested": _thinking_requested(body),
+                "thinking_budget_tokens": (body.get("thinking") or {}).get("budget_tokens") if isinstance(body.get("thinking"), dict) else None,
+                "message_count": len(body.get("messages", [])) if isinstance(body.get("messages"), list) else 0,
+                "content_types": _collect_message_content_types(body.get("messages")),
+                "tools_count": len(body.get("tools", [])) if isinstance(body.get("tools"), list) else 0,
+                "anthropic_beta": anthropic_beta,
+                "user_agent": (user_agent or "")[:160],
+                "forced_thinking": forced_thinking,
+                "force_thinking_user_agents": FORCE_THINKING_USER_AGENTS,
+                "strict_signed_thinking_default": STRICT_SIGNED_THINKING,
+                "require_signed_thinking": require_signed_thinking,
+            },
+            ensure_ascii=True,
+        ),
+    )
+
     openai_messages = _anthropic_messages_to_openai(body)
     openai_tools, openai_tool_choice = _convert_tools(body)
 
@@ -553,15 +1166,39 @@ async def messages(
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
 
+    if body.get("stream"):
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        try:
+            return StreamingResponse(
+                _stream_litellm_to_anthropic(payload, body["model"], require_signed_thinking),
+                media_type="text/event-stream",
+            )
+        except UpstreamError as exc:
+            return _error_response(exc.status_code, exc.body)
+
     payload["stream"] = False
     try:
         upstream = await _post_to_litellm(payload)
     except UpstreamError as exc:
         return _error_response(exc.status_code, exc.body)
 
-    anthropic_msg = _openai_to_anthropic_response(upstream, body["model"])
-
-    if body.get("stream"):
-        return StreamingResponse(_stream_events_from_message(anthropic_msg), media_type="text/event-stream")
+    anthropic_msg = _openai_to_anthropic_response(upstream, body["model"], require_signed_thinking)
+    LOGGER.info(
+        "messages.response %s",
+        json.dumps(
+            {
+                "request_id": request_id,
+                "stream": False,
+                "content_types": [
+                    block.get("type")
+                    for block in anthropic_msg.get("content", [])
+                    if isinstance(block, dict)
+                ],
+                "stop_reason": anthropic_msg.get("stop_reason"),
+            },
+            ensure_ascii=True,
+        ),
+    )
 
     return anthropic_msg
