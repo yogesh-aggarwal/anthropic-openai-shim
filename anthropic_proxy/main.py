@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -16,6 +16,11 @@ app = FastAPI(title="Anthropic Adapter")
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://litellm:4000/v1").rstrip("/")
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
 ADAPTER_API_KEY = os.getenv("ANTHROPIC_PROXY_API_KEY", "")
+OPENROUTER_ANTHROPIC_BASE = os.getenv("OPENROUTER_ANTHROPIC_BASE", "https://openrouter.ai/api/v1").rstrip("/")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+REFERENCE_STREAM_MODEL = "stepfun/step-3.5-flash:free"
 
 
 class UpstreamError(Exception):
@@ -23,6 +28,26 @@ class UpstreamError(Exception):
         self.status_code = status_code
         self.body = body
         super().__init__(f"Upstream error {status_code}")
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    if _HTTP_CLIENT is None:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized")
+    return _HTTP_CLIENT
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global _HTTP_CLIENT
+    _HTTP_CLIENT = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS)
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None:
+        await _HTTP_CLIENT.aclose()
+    _HTTP_CLIENT = None
 
 
 def _resolve_model(inbound_model: str) -> str:
@@ -275,6 +300,47 @@ def _finish_reason_to_stop_reason(finish_reason: str, had_tool_calls: bool) -> s
     return "end_turn"
 
 
+def _is_reference_model(model_name: str) -> bool:
+    return model_name == REFERENCE_STREAM_MODEL
+
+
+def _openrouter_headers(anthropic_version: Optional[str], anthropic_beta: Optional[str]) -> Dict[str, str]:
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": OPENROUTER_API_KEY,
+        "anthropic-version": anthropic_version or "2023-06-01",
+    }
+    if anthropic_beta:
+        headers["anthropic-beta"] = anthropic_beta
+    return headers
+
+
+async def _post_to_openrouter_messages(
+    body: Dict[str, Any], anthropic_version: Optional[str], anthropic_beta: Optional[str]
+) -> Dict[str, Any]:
+    client = _get_http_client()
+    headers = _openrouter_headers(anthropic_version, anthropic_beta)
+    resp = await client.post(f"{OPENROUTER_ANTHROPIC_BASE}/messages", headers=headers, json=body)
+    if resp.status_code >= 400:
+        try:
+            err_body: Any = resp.json()
+        except Exception:
+            err_body = {"error": {"message": resp.text, "code": resp.status_code}}
+        raise UpstreamError(resp.status_code, err_body)
+    return resp.json()
+
+
+async def _openrouter_stream_generator(cm: Any, resp: httpx.Response) -> AsyncGenerator[bytes, None]:
+    try:
+        async for chunk in resp.aiter_raw():
+            if chunk:
+                yield chunk
+    finally:
+        await cm.__aexit__(None, None, None)
+
+
 def _safe_json_loads(raw: str) -> Any:
     if raw is None:
         return {}
@@ -375,27 +441,27 @@ async def _post_to_litellm(payload: Dict[str, Any]) -> Dict[str, Any]:
         headers["Authorization"] = f"Bearer {LITELLM_API_KEY}"
 
     delay = 0.4
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        for attempt in range(MAX_RETRIES):
-            try:
-                resp = await client.post(f"{LITELLM_BASE_URL}/chat/completions", headers=headers, json=payload)
-                if resp.status_code in {429, 500, 502, 503, 504} and attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                    continue
-                if resp.status_code >= 400:
-                    try:
-                        body: Any = resp.json()
-                    except Exception:
-                        body = {"error": {"message": resp.text, "code": resp.status_code}}
-                    raise UpstreamError(resp.status_code, body)
-                return resp.json()
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                    continue
-                raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
+    client = _get_http_client()
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = await client.post(f"{LITELLM_BASE_URL}/chat/completions", headers=headers, json=payload)
+            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            if resp.status_code >= 400:
+                try:
+                    body: Any = resp.json()
+                except Exception:
+                    body = {"error": {"message": resp.text, "code": resp.status_code}}
+                raise UpstreamError(resp.status_code, body)
+            return resp.json()
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
 
     raise HTTPException(status_code=502, detail="Upstream request failed")
 
@@ -500,13 +566,39 @@ async def messages(
     anthropic_version: Optional[str] = Header(default=None),
     anthropic_beta: Optional[str] = Header(default=None),
 ) -> Any:
-    # Headers kept for Anthropic compatibility; adapter currently ignores version/beta flags.
-    _ = anthropic_version
-    _ = anthropic_beta
+    # Headers are accepted for Anthropic compatibility.
     _validate_adapter_auth(x_api_key, authorization)
 
     body = await request.json()
     body["model"] = _resolve_model(body.get("model", ""))
+
+    if _is_reference_model(body["model"]):
+        try:
+            if body.get("stream"):
+                client = _get_http_client()
+                headers = _openrouter_headers(anthropic_version, anthropic_beta)
+                cm = client.stream(
+                    "POST",
+                    f"{OPENROUTER_ANTHROPIC_BASE}/messages",
+                    headers=headers,
+                    json=body,
+                )
+                resp = await cm.__aenter__()
+                if resp.status_code >= 400:
+                    raw = await resp.aread()
+                    await cm.__aexit__(None, None, None)
+                    try:
+                        err_body: Any = json.loads(raw.decode("utf-8", errors="replace"))
+                    except Exception:
+                        err_body = {"error": {"message": raw.decode("utf-8", errors="replace"), "code": resp.status_code}}
+                    return _error_response(resp.status_code, err_body)
+                media_type = resp.headers.get("content-type", "text/event-stream")
+                return StreamingResponse(_openrouter_stream_generator(cm, resp), media_type=media_type)
+
+            return await _post_to_openrouter_messages(body, anthropic_version, anthropic_beta)
+        except UpstreamError as exc:
+            return _error_response(exc.status_code, exc.body)
+
     openai_messages = _anthropic_messages_to_openai(body)
     openai_tools, openai_tool_choice = _convert_tools(body)
 
@@ -517,7 +609,7 @@ async def messages(
         "temperature": body.get("temperature"),
         "top_p": body.get("top_p"),
         "stop": body.get("stop_sequences"),
-        "stream": False,
+        "stream": bool(body.get("stream")),
     }
     if DROP_UNSUPPORTED_PARAMS:
         payload = {k: v for k, v in payload.items() if v is not None}
@@ -531,6 +623,7 @@ async def messages(
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
 
+    payload["stream"] = False
     try:
         upstream = await _post_to_litellm(payload)
     except UpstreamError as exc:
