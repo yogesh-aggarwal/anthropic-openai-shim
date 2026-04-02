@@ -258,6 +258,10 @@ curl http://localhost:8080/health
 
 **Authentication Failed**: Verify `LITELLM_MASTER_KEY` in your `.env` file
 
+**Platform Mismatch (`linux/amd64` vs `linux/arm64`)**:
+The `litellm` service defaults to `linux/amd64` in `compose.yml` for compatibility on ARM hosts.
+If a native ARM image is available in your setup, set `LITELLM_PLATFORM=linux/arm64` in `.env`.
+
 **Model Not Found**: Check `models.yaml` configuration and run `make reload`
 
 **Rate Limiting**: Configure provider-specific rate limits in `models.yaml`

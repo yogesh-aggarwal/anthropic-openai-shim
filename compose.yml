@@ -12,6 +12,7 @@ services:
 
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
+    platform: ${LITELLM_PLATFORM:-linux/amd64}
     container_name: litellm-proxy
     depends_on:
       - postgres
