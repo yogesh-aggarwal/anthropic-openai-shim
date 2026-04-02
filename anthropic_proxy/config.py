@@ -1,0 +1,5 @@
+MAX_RETRIES = 3
+REQUEST_TIMEOUT_SECONDS = 120
+
+# Keep this behavior fixed in code.
+DROP_UNSUPPORTED_PARAMS = True

@@ -1,0 +1,8 @@
+include:
+  - models.yaml
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true

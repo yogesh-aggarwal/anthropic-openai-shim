@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: litellm-postgres
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+    volumes:
+      - litellm_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  litellm:
+    image: litellm/litellm:latest
+    platform: linux/amd64
+    container_name: litellm-proxy
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://litellm:litellm@postgres:5432/litellm
+      STORE_MODEL_IN_DB: "True"
+    ports:
+      - "8080:4000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml:ro
+      - ./models.yaml:/app/models.yaml:ro
+    command: ["--config", "/app/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
+    restart: unless-stopped
+
+  anthropic-adapter:
+    build:
+      context: ./anthropic_proxy
+      dockerfile: Dockerfile
+    container_name: anthropic-adapter
+    depends_on:
+      - litellm
+    ports:
+      - "4000:8080"
+    env_file:
+      - .env
+    environment:
+      LITELLM_BASE_URL: http://litellm:4000/v1
+      LITELLM_API_KEY: ${LITELLM_MASTER_KEY}
+      ANTHROPIC_PROXY_API_KEY: ${LITELLM_MASTER_KEY}
+    restart: unless-stopped
+
+volumes:
+  litellm_postgres_data:
