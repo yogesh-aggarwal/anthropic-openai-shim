@@ -30,6 +30,7 @@ FORCE_THINKING_USER_AGENTS = [
     if token.strip()
 ]
 FORCE_THINKING_BUDGET_TOKENS = int(os.getenv("FORCE_THINKING_BUDGET_TOKENS", "4096") or 4096)
+FORCE_THINKING_FOR_ALL_REQUESTS = os.getenv("FORCE_THINKING_FOR_ALL_REQUESTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
@@ -138,6 +139,8 @@ def _should_require_signed_thinking(body: Dict[str, Any], user_agent: Optional[s
 def _should_force_thinking(body: Dict[str, Any], user_agent: Optional[str]) -> bool:
     if _thinking_requested(body):
         return False
+    if FORCE_THINKING_FOR_ALL_REQUESTS:
+        return True
     if not FORCE_THINKING_USER_AGENTS:
         return False
     ua = (user_agent or "").lower()
@@ -1109,13 +1112,12 @@ async def messages(
     body = await request.json()
     body["model"] = _resolve_model(body.get("model", ""))
 
-    forced_thinking = False
-    if _should_force_thinking(body, user_agent):
-        body["thinking"] = {
-            "type": "enabled",
-            "budget_tokens": FORCE_THINKING_BUDGET_TOKENS,
-        }
-        forced_thinking = True
+    # Force thinking for every request, regardless of client or user-agent.
+    body["thinking"] = {
+        "type": "enabled",
+        "budget_tokens": FORCE_THINKING_BUDGET_TOKENS,
+    }
+    forced_thinking = True
 
     request_id = uuid.uuid4().hex[:12]
     require_signed_thinking = _should_require_signed_thinking(body, user_agent)
@@ -1134,6 +1136,7 @@ async def messages(
                 "anthropic_beta": anthropic_beta,
                 "user_agent": (user_agent or "")[:160],
                 "forced_thinking": forced_thinking,
+                "force_thinking_for_all_requests": FORCE_THINKING_FOR_ALL_REQUESTS,
                 "force_thinking_user_agents": FORCE_THINKING_USER_AGENTS,
                 "strict_signed_thinking_default": STRICT_SIGNED_THINKING,
                 "require_signed_thinking": require_signed_thinking,
