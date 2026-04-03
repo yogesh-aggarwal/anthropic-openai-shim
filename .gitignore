@@ -2,3 +2,4 @@ __pycache__/
 
 .env
 models.yaml
+models.config.yaml

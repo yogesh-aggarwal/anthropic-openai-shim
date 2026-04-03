@@ -1,4 +1,4 @@
-.PHONY: start stop restart restart-proxy status logs
+.PHONY: start stop restart restart-proxy status logs models
 
 start:
 	@docker compose up -d --build
@@ -15,3 +15,6 @@ status:
 
 logs:
 	@docker compose logs -f anthropic-adapter litellm
+
+models:
+	@python scripts/models.py
