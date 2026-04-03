@@ -844,6 +844,7 @@ def _extract_stream_delta_reasoning(delta: Dict[str, Any]) -> Tuple[str, str, st
 async def _stream_litellm_to_anthropic(
     payload: Dict[str, Any],
     model_name: str,
+    require_signed_thinking: bool,
 ) -> AsyncIterator[bytes]:
     headers = {
         "Content-Type": "application/json",
@@ -923,6 +924,7 @@ async def _stream_litellm_to_anthropic(
                     nonlocal next_content_index, active_text_index, active_thinking_index, active_redacted_index
                     nonlocal pending_thinking_text
                     nonlocal had_tool_calls, started
+                    nonlocal stop_sequence
 
                     if raw_data == "[DONE]":
                         return
@@ -1391,7 +1393,7 @@ async def messages(
         payload["stream_options"] = {"include_usage": True}
         try:
             return StreamingResponse(
-                _stream_litellm_to_anthropic(payload, body["model"]),
+                _stream_litellm_to_anthropic(payload, body["model"], require_signed_thinking),
                 media_type="text/event-stream",
             )
         except UpstreamError as exc:
