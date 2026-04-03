@@ -3,62 +3,70 @@
 
 import itertools
 import yaml
+from collections import defaultdict
 from pathlib import Path
 
 
 def convert_models(input_path: str, output_path: str) -> None:
     """Convert models.config.yaml to models.yaml format.
 
-    Model names use format: provider:models.items.split("/")[-1]
-    e.g., kilo.openai/x-ai/grok-code-fast-1:optimized:free -> kilo:grok-code-fast-1:optimized:free
+    Model names use unique model ID: model.split("/")[-1].split(":")[0]
+    Each model is backed by all available providers as fallbacks.
     """
-    with open(input_path, 'r') as f:
+    with open(input_path, "r") as f:
         data = yaml.safe_load(f)
 
-    model_list = []
+    grouped = defaultdict(list)
 
-    # Process each provider
+    # Process each provider and group by unique model ID
     for provider, info in data.items():
         # Deduplicate models while preserving order
-        models = list(dict.fromkeys(info.get('models', [])))
-        api_base = info.get('base')
+        models = list(dict.fromkeys(info.get("models", [])))
+        api_base = info.get("base")
         # Deduplicate keys while preserving order
-        api_keys = list(dict.fromkeys(info.get('keys', [])))
+        api_keys = list(dict.fromkeys(info.get("keys", [])))
 
         # Generate all combinations of models and keys (Cartesian product)
         for model, api_key in itertools.product(models, api_keys):
-            # Split on first '/' to separate provider prefix from rest
-            # e.g., "openai/x-ai/grok-code-fast-1:optimized:free"
-            parts = model.split('/', 1)
-            if len(parts) == 2:
-                # Take the last component after splitting by '/'
-                model_suffix = parts[1].split('/')[-1]
-            else:
-                model_suffix = model
+            unique_id = model.split("/")[-1].split(":")[0]
+            grouped[unique_id].append((model, api_base, api_key))
 
-            # Create model_name in format: provider:model_suffix
-            model_name = f"{provider}:{model_suffix}"
+    model_list = []
 
-            model_entry = {
-                'model_name': model_name,
-                'litellm_params': {
-                    'model': model,
-                    'api_base': api_base,
-                    'api_key': api_key,
+    # Create model entries with fallbacks
+    for unique_id, items in grouped.items():
+        primary_model, primary_base, primary_key = items[0]
+        fallbacks = items[1:]
+
+        litellm_params = {
+            "model": primary_model,
+            "api_base": primary_base,
+            "api_key": primary_key,
+        }
+
+        if fallbacks:
+            litellm_params["fallbacks"] = [
+                {
+                    "model": m,
+                    "api_base": b,
+                    "api_key": k,
                 }
-            }
-            model_list.append(model_entry)
+                for m, b, k in fallbacks
+            ]
 
-    output = {'model_list': model_list}
+        model_entry = {"model_name": unique_id, "litellm_params": litellm_params}
+        model_list.append(model_entry)
 
-    with open(output_path, 'w') as f:
+    output = {"model_list": model_list}
+
+    with open(output_path, "w") as f:
         yaml.dump(output, f, default_flow_style=False, sort_keys=False)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     script_dir = Path(__file__).parent.parent
-    input_file = script_dir / 'models.config.yaml'
-    output_file = script_dir / 'models.yaml'
+    input_file = script_dir / "models.config.yaml"
+    output_file = script_dir / "models.yaml"
 
     convert_models(str(input_file), str(output_file))
     print("Converted models ✌️")
