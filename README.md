@@ -41,11 +41,21 @@ cp .env.example .env
 ### 3. Model Configuration
 
 ```bash
-# Copy and configure model settings
-cp models.example.yaml models.yaml
+# Configure models in models.config.yaml
+# Each provider contains base URL, models list, and keys list
+# All model-key combinations are automatically generated
 
-# Edit models.yaml with your provider configurations
-# Add your API keys and model preferences
+# Example models.config.yaml:
+# kilo:
+#   base: https://api.kilo.ai/api/gateway
+#   models:
+#     - openai/x-ai/grok-code-fast-1:optimized:free
+#     - openai/qwen/qwen3.6-plus:free
+#   keys:
+#     - your_api_key_here
+
+# Generate models.yaml from config
+make models
 ```
 
 ### 4. Launch Services
@@ -194,6 +204,7 @@ make status         # Show service status
 make logs           # View all service logs
 
 # Configuration
+make models         # Generate models.yaml from models.config.yaml
 make reload         # Reload LiteLLM config without restart
 make clear-db       # Reset database (⚠️  destructive)
 
@@ -205,20 +216,22 @@ make test           # Run tests
 
 ### Adding New Models
 
-1. **Edit `models.yaml`**:
+1. **Edit `models.config.yaml`**:
    ```yaml
-   - model_name: your-custom-model
-     litellm_params:
-       model: provider/model-name
-       api_key: your_api_key
-       api_base: https://custom-endpoint.com
-     model_info:
-       mode: chat
-       input_cost_per_token: 0.000001
-       output_cost_per_token: 0.000002
+   provider-name:
+     base: https://api.provider.com/v1
+     models:
+       - provider/model-name
+     keys:
+       - your_api_key
    ```
 
-2. **Reload configuration**:
+2. **Generate models.yaml**:
+   ```bash
+   make models
+   ```
+
+3. **Reload configuration**:
    ```bash
    make reload
    ```
