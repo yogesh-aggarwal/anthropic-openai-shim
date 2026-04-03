@@ -7,6 +7,17 @@ from collections import defaultdict
 from pathlib import Path
 
 
+class CostValue:
+    """Custom YAML representer to output cost values without scientific notation."""
+
+    def __init__(self, value):
+        self.value = value
+
+    @staticmethod
+    def representer(dumper, data):
+        return dumper.represent_scalar("tag:yaml.org,2002:float", f"{data.value:.6f}")
+
+
 def convert_models(input_path: str, output_path: str) -> None:
     """Convert models.config.yaml to models.yaml format.
 
@@ -54,10 +65,19 @@ def convert_models(input_path: str, output_path: str) -> None:
                 for m, b, k in fallbacks
             ]
 
-        model_entry = {"model_name": unique_id, "litellm_params": litellm_params}
+        model_entry = {
+            "model_name": unique_id,
+            "litellm_params": litellm_params,
+            "model_info": {
+                "input_cost_per_token": CostValue(0.000003),
+                "output_cost_per_token": CostValue(0.000015),
+            },
+        }
         model_list.append(model_entry)
 
     output = {"model_list": model_list}
+
+    yaml.add_representer(CostValue, CostValue.representer)
 
     with open(output_path, "w") as f:
         yaml.dump(output, f, default_flow_style=False, sort_keys=False)
