@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Convert models.config.yaml to models.yaml format."""
+"""Discover free models and convert to LiteLLM models.yaml format.
 
+Pipeline:
+1. Read providers.yaml
+2. For providers without explicit models, fetch {base}/models and filter for "free"
+3. Write models.config.yaml
+4. Convert models.config.yaml to models.yaml with fallbacks and pricing
+"""
+
+import httpx
 import itertools
 import yaml
 from collections import defaultdict
@@ -18,33 +26,81 @@ class CostValue:
         return dumper.represent_scalar("tag:yaml.org,2002:float", f"{data.value:.6f}")
 
 
-def convert_models(input_path: str, output_path: str) -> None:
-    """Convert models.config.yaml to models.yaml format.
+def fetch_models(base: str, api_key: str) -> list[str]:
+    """Fetch available models from an OpenAI-compatible /models endpoint."""
+    url = f"{base.rstrip('/')}/models"
+    resp = httpx.get(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [m["id"] for m in data.get("data", [])]
 
-    Model names use unique model ID: model.split("/")[-1].split(":")[0]
-    Each model is backed by all available providers as fallbacks.
-    """
-    with open(input_path, "r") as f:
-        data = yaml.safe_load(f)
 
+def discover_free_models(providers: dict) -> dict:
+    """For providers without a models key, discover free models via API."""
+    results = {}
+
+    for provider_name, info in providers.items():
+        base = info.get("base", "")
+        keys = info.get("keys", [])
+        models = info.get("models")
+
+        if models:
+            results[provider_name] = info
+            continue
+
+        if not base or not keys:
+            print(f"Skipping {provider_name}: no base or keys")
+            continue
+
+        print(f"Discovering models for {provider_name} at {base}/models ...")
+
+        free_models = set()
+        for key in keys:
+            try:
+                all_models = fetch_models(base, key)
+                for model_id in all_models:
+                    if "free" in model_id.lower():
+                        prefix = info.get("prefix", "openai")
+                        free_models.add(f"{prefix}/{model_id}")
+                print(
+                    f"  Found {len(free_models)} free models (using first working key)"
+                )
+                break
+            except Exception as e:
+                print(f"  Key failed: {e}")
+                continue
+
+        if free_models:
+            results[provider_name] = {
+                "base": base,
+                "models": sorted(free_models),
+                "keys": keys,
+            }
+        else:
+            print(f"  No free models found for {provider_name}")
+
+    return results
+
+
+def convert_models(config: dict, output_path: str) -> None:
+    """Convert models.config dict to models.yaml format."""
     grouped = defaultdict(list)
 
-    # Process each provider and group by unique model ID
-    for provider, info in data.items():
-        # Deduplicate models while preserving order
+    for provider, info in config.items():
         models = list(dict.fromkeys(info.get("models", [])))
         api_base = info.get("base")
-        # Deduplicate keys while preserving order
         api_keys = list(dict.fromkeys(info.get("keys", [])))
 
-        # Generate all combinations of models and keys (Cartesian product)
         for model, api_key in itertools.product(models, api_keys):
             unique_id = model.split("/")[-1].split(":")[0]
             grouped[unique_id].append((model, api_base, api_key))
 
     model_list = []
 
-    # Create model entries with fallbacks
     for unique_id, items in grouped.items():
         primary_model, primary_base, primary_key = items[0]
         fallbacks = items[1:]
@@ -83,10 +139,25 @@ def convert_models(input_path: str, output_path: str) -> None:
         yaml.dump(output, f, default_flow_style=False, sort_keys=False)
 
 
-if __name__ == "__main__":
+def main() -> None:
     script_dir = Path(__file__).parent.parent
-    input_file = script_dir / "models.config.yaml"
+    providers_file = script_dir / "providers.yaml"
+    config_file = script_dir / "models.config.yaml"
     output_file = script_dir / "models.yaml"
 
-    convert_models(str(input_file), str(output_file))
+    with open(providers_file) as f:
+        providers = yaml.safe_load(f)
+
+    config = discover_free_models(providers)
+
+    with open(config_file, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    print(f"\nWrote models.config.yaml with {len(config)} providers")
+
+    convert_models(config, str(output_file))
     print("Converted models ✌️")
+
+
+if __name__ == "__main__":
+    main()

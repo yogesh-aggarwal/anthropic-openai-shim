@@ -12,6 +12,6 @@
   "explorer.fileNesting.patterns": {
     ".env": ".env.*",
     "litellm_config.yaml": "Makefile, .gitignore, *.yml",
-    "models.yaml": "models.*.yaml",
+    "providers.yaml": "models.yaml, models.*.yaml",
   }
 }

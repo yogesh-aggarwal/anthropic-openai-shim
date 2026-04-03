@@ -1,5 +1,7 @@
 __pycache__/
 
 .env
+
+providers.yaml
 models.yaml
 models.config.yaml
