@@ -20,6 +20,7 @@ app = FastAPI(title="Anthropic Adapter")
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://litellm:4000/v1").rstrip("/")
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
 ADAPTER_API_KEY = os.getenv("ANTHROPIC_PROXY_API_KEY", "")
+ADAPTER_STRICT_API_KEY = os.getenv("ANTHROPIC_PROXY_STRICT_API_KEY", "false").strip().lower() in {"1", "true", "yes", "on"}
 STRICT_SIGNED_THINKING = os.getenv("STRICT_SIGNED_THINKING", "true").strip().lower() in {"1", "true", "yes", "on"}
 ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED = os.getenv("ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED", "false").strip().lower() in {"1", "true", "yes", "on"}
 ALLOW_UNSIGNED_THINKING_USER_AGENTS = [
@@ -81,11 +82,29 @@ def _extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
 
 
 def _validate_adapter_auth(x_api_key: Optional[str], authorization: Optional[str]) -> None:
-    if not ADAPTER_API_KEY:
-        return
     candidate = x_api_key or _extract_bearer_token(authorization)
-    if candidate != ADAPTER_API_KEY:
+
+    if ADAPTER_API_KEY and candidate == ADAPTER_API_KEY:
+        return
+
+    # In non-strict mode, accept any provided caller key and let LiteLLM enforce
+    # virtual-key auth, spend limits, and routing policy.
+    if not ADAPTER_STRICT_API_KEY and candidate:
+        return
+
+    if not ADAPTER_API_KEY and not candidate:
+        raise HTTPException(status_code=401, detail="Missing API key")
+
+    if ADAPTER_API_KEY and not candidate:
+        raise HTTPException(status_code=401, detail="Missing API key")
+
+    if ADAPTER_STRICT_API_KEY and ADAPTER_API_KEY and candidate != ADAPTER_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _effective_upstream_api_key(x_api_key: Optional[str], authorization: Optional[str]) -> Optional[str]:
+    caller_key = x_api_key or _extract_bearer_token(authorization)
+    return caller_key or LITELLM_API_KEY or None
 
 
 def _thinking_requested(body: Dict[str, Any]) -> bool:
@@ -742,10 +761,10 @@ def _openai_to_anthropic_response(
     }
 
 
-async def _post_to_litellm(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _post_to_litellm(payload: Dict[str, Any], upstream_api_key: Optional[str]) -> Dict[str, Any]:
     headers = {"Content-Type": "application/json"}
-    if LITELLM_API_KEY:
-        headers["Authorization"] = f"Bearer {LITELLM_API_KEY}"
+    if upstream_api_key:
+        headers["Authorization"] = f"Bearer {upstream_api_key}"
 
     delay = 0.4
     client = _get_http_client()
@@ -845,6 +864,7 @@ async def _stream_litellm_to_anthropic(
     payload: Dict[str, Any],
     model_name: str,
     require_signed_thinking: bool,
+    upstream_api_key: Optional[str],
 ) -> AsyncIterator[bytes]:
     headers = {
         "Content-Type": "application/json",
@@ -852,8 +872,8 @@ async def _stream_litellm_to_anthropic(
         "Accept-Encoding": "identity",
         "Cache-Control": "no-cache",
     }
-    if LITELLM_API_KEY:
-        headers["Authorization"] = f"Bearer {LITELLM_API_KEY}"
+    if upstream_api_key:
+        headers["Authorization"] = f"Bearer {upstream_api_key}"
 
     client = _get_http_client()
     delay = 0.4
@@ -1325,6 +1345,7 @@ async def messages(
     # Headers kept for Anthropic compatibility; adapter currently ignores version/beta flags.
     _require_anthropic_version(anthropic_version)
     _validate_adapter_auth(x_api_key, authorization)
+    upstream_api_key = _effective_upstream_api_key(x_api_key, authorization)
 
     body = await request.json()
     body["model"] = _resolve_model(body.get("model", ""))
@@ -1389,7 +1410,7 @@ async def messages(
         payload["stream_options"] = {"include_usage": True}
         try:
             return StreamingResponse(
-                _stream_litellm_to_anthropic(payload, body["model"], require_signed_thinking),
+                _stream_litellm_to_anthropic(payload, body["model"], require_signed_thinking, upstream_api_key),
                 media_type="text/event-stream",
             )
         except UpstreamError as exc:
@@ -1397,7 +1418,7 @@ async def messages(
 
     payload["stream"] = False
     try:
-        upstream = await _post_to_litellm(payload)
+        upstream = await _post_to_litellm(payload, upstream_api_key)
     except UpstreamError as exc:
         return _error_response(exc.status_code, exc.body)
 
