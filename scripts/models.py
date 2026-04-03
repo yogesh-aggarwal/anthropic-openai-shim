@@ -11,7 +11,6 @@ Pipeline:
 
 import httpx
 import itertools
-import json
 import yaml
 from collections import defaultdict
 from pathlib import Path
@@ -28,6 +27,28 @@ class CostValue:
     @staticmethod
     def representer(dumper, data):
         return dumper.represent_scalar("tag:yaml.org,2002:float", f"{data.value:.6f}")
+
+
+def model_slug(model_id: str) -> str:
+    """Return the model slug without the provider prefix."""
+    return model_id.split("/", 1)[-1] if "/" in model_id else model_id
+
+
+def openrouter_model_id(model_id: str) -> str:
+    """Return the base OpenRouter model id from a provider model slug.
+
+    For example, `openai/x-ai/grok-code-fast-1:optimized:free` becomes
+    `x-ai/grok-code-fast-1`.
+    """
+    slug = model_slug(model_id)
+    return slug.split(":", 1)[0]
+
+
+def final_model_name(model_id: str) -> str:
+    """Return model_name as text between the last '/' and first ':'."""
+    slug = model_slug(model_id)
+    after_last_slash = slug.rsplit("/", 1)[-1]
+    return after_last_slash.split(":", 1)[0]
 
 
 def fetch_openrouter_models(api_key: str) -> list[dict]:
@@ -54,25 +75,44 @@ def fetch_provider_models(base: str, api_key: str) -> list[str]:
     return [m["id"] for m in data.get("data", [])]
 
 
+def fetch_provider_model_data(base: str, api_key: str) -> list[dict]:
+    """Fetch full model objects from an OpenAI-compatible /models endpoint."""
+    url = f"{base.rstrip('/')}/models"
+    resp = httpx.get(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("data", [])
+
+
 def fuzzy_match(provider_model: str, openrouter_free_ids: list[str]) -> str | None:
     """Fuzzy match a provider model ID against OpenRouter free model IDs.
 
     Strips common prefixes/suffixes and does substring matching.
     Returns the matched OpenRouter model ID or None.
     """
-    normalized = provider_model.lower().split(":")[0]
+    normalized = provider_model.lower().strip()
 
     for or_id in openrouter_free_ids:
-        or_normalized = or_id.lower().split(":")[0]
+        or_normalized = or_id.lower().strip()
 
         if normalized == or_normalized:
+            return or_id
+
+        provider_base = normalized.split(":")[0]
+        or_base = or_normalized.split(":")[0]
+
+        if provider_base == or_base:
             return or_id
 
         if normalized in or_normalized or or_normalized in normalized:
             return or_id
 
-        provider_parts = set(normalized.replace("/", " ").replace("-", " ").split())
-        or_parts = set(or_normalized.replace("/", " ").replace("-", " ").split())
+        provider_parts = set(provider_base.replace("/", " ").replace("-", " ").split())
+        or_parts = set(or_base.replace("/", " ").replace("-", " ").split())
 
         if provider_parts & or_parts and (
             provider_parts.issubset(or_parts) or or_parts.issubset(provider_parts)
@@ -96,22 +136,21 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
     Returns (config dict, openrouter metadata lookup dict).
     """
     openrouter_info = providers.get("openrouter", {})
-    openrouter_base = openrouter_info.get(
-        "base", OPENROUTER_MODELS_URL.rsplit("/models", 1)[0]
-    )
     openrouter_keys = openrouter_info.get("keys", [])
     openrouter_prefix = openrouter_info.get("prefix", "openrouter")
 
-    print(f"Fetching models from OpenRouter ...")
-    all_openrouter_models: list[dict] = []
+    print("Fetching models from OpenRouter ...")
+    openrouter_models_by_id: dict[str, dict] = {}
     for key in openrouter_keys:
         try:
-            all_openrouter_models = fetch_openrouter_models(key)
-            print(f"  Found {len(all_openrouter_models)} total models")
-            break
+            for model in fetch_openrouter_models(key):
+                openrouter_models_by_id[model["id"]] = model
         except Exception as e:
             print(f"  Key failed: {e}")
             continue
+
+    all_openrouter_models = list(openrouter_models_by_id.values())
+    print(f"  Found {len(all_openrouter_models)} total models")
 
     free_models = [m for m in all_openrouter_models if "free" in m["id"].lower()]
     free_model_ids = [m["id"] for m in free_models]
@@ -144,18 +183,25 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
             continue
 
         print(f"Checking {provider_name} against OpenRouter free models ...")
-        provider_models: list[str] = []
+        provider_models_by_id: dict[str, dict] = {}
         for key in keys:
             try:
-                provider_models = fetch_provider_models(base, key)
-                break
+                for model in fetch_provider_model_data(base, key):
+                    provider_models_by_id[model["id"]] = model
             except Exception as e:
                 print(f"  Key failed: {e}")
                 continue
 
+        provider_models = list(provider_models_by_id.values())
+
         matched = []
-        for pm in provider_models:
-            match = fuzzy_match(pm, free_model_ids)
+        for model in provider_models:
+            provider_model_id = model["id"]
+            if "free" in provider_model_id.lower():
+                matched.append(f"{prefix}/{provider_model_id}")
+                continue
+
+            match = fuzzy_match(provider_model_id, free_model_ids)
             if match:
                 matched.append(f"{prefix}/{match}")
 
@@ -167,7 +213,7 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
             }
             print(f"  {len(matched)} matching free models")
         else:
-            print(f"  No matching free models")
+            print("  No matching free models")
 
     return results, or_lookup
 
@@ -182,7 +228,7 @@ def convert_models(config: dict, or_lookup: dict, output_path: str) -> None:
         api_keys = list(dict.fromkeys(info.get("keys", [])))
 
         for model, api_key in itertools.product(models, api_keys):
-            unique_id = model.split("/")[-1].split(":")[0]
+            unique_id = final_model_name(model)
             grouped[unique_id].append((model, api_base, api_key))
 
     model_list = []
@@ -209,9 +255,7 @@ def convert_models(config: dict, or_lookup: dict, output_path: str) -> None:
 
         model_info: dict = {}
 
-        or_model_id = (
-            primary_model.split("/", 1)[-1] if "/" in primary_model else primary_model
-        )
+        or_model_id = openrouter_model_id(primary_model)
         if or_model_id in or_lookup:
             or_data = or_lookup[or_model_id]
             skip_keys = {"id", "pricing"}

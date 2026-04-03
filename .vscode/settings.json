@@ -13,5 +13,6 @@
     ".env": ".env.*",
     "litellm_config.yaml": "Makefile, .gitignore, *.yml",
     "providers.yaml": "models.yaml, models.*.yaml",
-  }
+  },
+  "python-envs.defaultEnvManager": "ms-python.python:pyenv"
 }
