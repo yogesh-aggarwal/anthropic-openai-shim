@@ -48,7 +48,10 @@ def final_model_name(model_id: str) -> str:
     """Return model_name as text between the last '/' and first ':'."""
     slug = model_slug(model_id)
     after_last_slash = slug.rsplit("/", 1)[-1]
-    return after_last_slash.split(":", 1)[0]
+    name = after_last_slash.split(":", 1)[0]
+    if name.endswith("-free"):
+        return name[: -len("-free")]
+    return name
 
 
 def fetch_openrouter_models(api_key: str) -> list[dict]:
