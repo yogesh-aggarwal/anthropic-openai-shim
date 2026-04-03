@@ -984,8 +984,7 @@ async def _stream_litellm_to_anthropic(
 
                     thinking_piece, thinking_signature, redacted_piece = _extract_stream_delta_reasoning(delta)
                     if (
-                        require_signed_thinking
-                        and active_thinking_index is None
+                        active_thinking_index is None
                         and thinking_signature
                         and pending_thinking_text
                     ):
@@ -1019,36 +1018,33 @@ async def _stream_litellm_to_anthropic(
                         pending_thinking_text = ""
 
                     if thinking_piece:
-                        if require_signed_thinking and active_thinking_index is None and not thinking_signature:
-                            pending_thinking_text += thinking_piece
-                        else:
-                            async for event in close_text_block():
-                                yield event
-                            async for event in close_redacted_block():
-                                yield event
+                        async for event in close_text_block():
+                            yield event
+                        async for event in close_redacted_block():
+                            yield event
 
-                            if active_thinking_index is None:
-                                active_thinking_index = next_content_index
-                                next_content_index += 1
-                                yield _sse(
-                                    "content_block_start",
-                                    {
-                                        "type": "content_block_start",
-                                        "index": active_thinking_index,
-                                        "content_block": {"type": "thinking", "thinking": "", "signature": thinking_signature},
-                                    },
-                                )
-
-                            merged_thinking_piece = f"{pending_thinking_text}{thinking_piece}" if pending_thinking_text else thinking_piece
-                            pending_thinking_text = ""
+                        if active_thinking_index is None:
+                            active_thinking_index = next_content_index
+                            next_content_index += 1
                             yield _sse(
-                                "content_block_delta",
+                                "content_block_start",
                                 {
-                                    "type": "content_block_delta",
+                                    "type": "content_block_start",
                                     "index": active_thinking_index,
-                                    "delta": {"type": "thinking_delta", "thinking": merged_thinking_piece},
+                                    "content_block": {"type": "thinking", "thinking": "", "signature": thinking_signature},
                                 },
                             )
+
+                        merged_thinking_piece = f"{pending_thinking_text}{thinking_piece}" if pending_thinking_text else thinking_piece
+                        pending_thinking_text = ""
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": active_thinking_index,
+                                "delta": {"type": "thinking_delta", "thinking": merged_thinking_piece},
+                            },
+                        )
 
                     if redacted_piece and pending_thinking_text and active_thinking_index is None:
                         pending_thinking_text = ""
