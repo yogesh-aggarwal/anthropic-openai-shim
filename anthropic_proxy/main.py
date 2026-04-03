@@ -2,11 +2,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from config import DROP_UNSUPPORTED_PARAMS, MAX_RETRIES, REQUEST_TIMEOUT_SECONDS
@@ -18,20 +21,16 @@ LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://litellm:4000/v1").rstri
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
 ADAPTER_API_KEY = os.getenv("ANTHROPIC_PROXY_API_KEY", "")
 STRICT_SIGNED_THINKING = os.getenv("STRICT_SIGNED_THINKING", "true").strip().lower() in {"1", "true", "yes", "on"}
-ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED = os.getenv("ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED", "true").strip().lower() in {"1", "true", "yes", "on"}
+ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED = os.getenv("ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED", "false").strip().lower() in {"1", "true", "yes", "on"}
 ALLOW_UNSIGNED_THINKING_USER_AGENTS = [
     token.strip().lower()
     for token in os.getenv("ALLOW_UNSIGNED_THINKING_USER_AGENTS", "").split(",")
     if token.strip()
 ]
-FORCE_THINKING_USER_AGENTS = [
-    token.strip().lower()
-    for token in os.getenv("FORCE_THINKING_USER_AGENTS", "claude-cli/2.1.90").split(",")
-    if token.strip()
-]
-FORCE_THINKING_BUDGET_TOKENS = int(os.getenv("FORCE_THINKING_BUDGET_TOKENS", "4096") or 4096)
-FORCE_THINKING_FOR_ALL_REQUESTS = os.getenv("FORCE_THINKING_FOR_ALL_REQUESTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MODELS_FILE = REPO_ROOT / "models.yaml"
+ANTHROPIC_API_VERSION = "2023-06-01"
 _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 
@@ -94,6 +93,23 @@ def _thinking_requested(body: Dict[str, Any]) -> bool:
     return isinstance(thinking, dict) and thinking.get("type") == "enabled"
 
 
+def _should_require_signed_thinking(body: Dict[str, Any], user_agent: Optional[str]) -> bool:
+    if not STRICT_SIGNED_THINKING:
+        return False
+
+    if not _thinking_requested(body):
+        return True
+
+    if not ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED:
+        return True
+
+    if not ALLOW_UNSIGNED_THINKING_USER_AGENTS:
+        return False
+
+    ua = (user_agent or "").lower()
+    return not any(token in ua for token in ALLOW_UNSIGNED_THINKING_USER_AGENTS)
+
+
 def _collect_message_content_types(messages: Any) -> List[str]:
     seen: set[str] = set()
     if not isinstance(messages, list):
@@ -119,34 +135,6 @@ def _collect_message_content_types(messages: Any) -> List[str]:
     return sorted(seen)
 
 
-def _should_require_signed_thinking(body: Dict[str, Any], user_agent: Optional[str]) -> bool:
-    if not STRICT_SIGNED_THINKING:
-        return False
-
-    if not _thinking_requested(body):
-        return True
-
-    if not ALLOW_UNSIGNED_THINKING_WHEN_REQUESTED:
-        return True
-
-    if not ALLOW_UNSIGNED_THINKING_USER_AGENTS:
-        return False
-
-    ua = (user_agent or "").lower()
-    return not any(token in ua for token in ALLOW_UNSIGNED_THINKING_USER_AGENTS)
-
-
-def _should_force_thinking(body: Dict[str, Any], user_agent: Optional[str]) -> bool:
-    if _thinking_requested(body):
-        return False
-    if FORCE_THINKING_FOR_ALL_REQUESTS:
-        return True
-    if not FORCE_THINKING_USER_AGENTS:
-        return False
-    ua = (user_agent or "").lower()
-    return any(token in ua for token in FORCE_THINKING_USER_AGENTS)
-
-
 def _extract_error_message(body: Any) -> str:
     if isinstance(body, str):
         return body
@@ -170,16 +158,253 @@ def _extract_error_message(body: Any) -> str:
 
 
 def _error_response(status_code: int, body: Any) -> JSONResponse:
-    # Envelope shape tolerated by Anthropic-compatible clients.
+    # Map status codes to Anthropic error types per specification
+    error_type = "api_error"
+    if status_code in (400, 422):
+        error_type = "invalid_request_error"
+    elif status_code == 401:
+        error_type = "authentication_error"
+    elif status_code == 403:
+        error_type = "permission_error"
+    elif status_code == 404:
+        error_type = "not_found_error"
+    elif status_code == 429:
+        error_type = "overloaded_error"
+
     return JSONResponse(
         status_code=status_code,
-        content={"error": {"message": _extract_error_message(body), "code": status_code}},
+        content={"error": {"message": _extract_error_message(body), "type": error_type}},
     )
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
-    return _error_response(exc.status_code, exc.detail)
+    return _error_response(exc.status_code, {"error": {"message": exc.detail}})
+
+
+def _require_anthropic_version(anthropic_version: Optional[str]) -> None:
+    if not anthropic_version:
+        raise HTTPException(status_code=400, detail="Missing anthropic-version header")
+    if anthropic_version != ANTHROPIC_API_VERSION:
+        raise HTTPException(status_code=400, detail=f"Unsupported anthropic-version: {anthropic_version}")
+
+
+def _usage_from_upstream(usage: Any) -> Dict[str, Any]:
+    if not isinstance(usage, dict):
+        usage = {}
+
+    cache_creation = usage.get("cache_creation_input_tokens")
+    cache_read = usage.get("cache_read_input_tokens")
+
+    return {
+        "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "output_tokens": int(usage.get("completion_tokens", 0) or 0),
+        "cache_creation_input_tokens": int(cache_creation or 0) if cache_creation is not None else None,
+        "cache_read_input_tokens": int(cache_read or 0) if cache_read is not None else 0,
+    }
+
+
+def _extract_stop_sequence(openai_resp: Dict[str, Any], choice: Dict[str, Any]) -> Optional[str]:
+    for candidate in (
+        choice.get("stop_sequence"),
+        choice.get("stop"),
+        openai_resp.get("stop_sequence"),
+        openai_resp.get("stop"),
+    ):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _approx_token_count(text: str) -> int:
+    normalized = text.strip()
+    if not normalized:
+        return 0
+    return max(1, (len(normalized) + 3) // 4)
+
+
+def _count_tokens_for_content(content: Any) -> int:
+    if isinstance(content, str):
+        return _approx_token_count(content)
+
+    if isinstance(content, list):
+        total = 0
+        for block in content:
+            if isinstance(block, str):
+                total += _approx_token_count(block)
+                continue
+
+            if not isinstance(block, dict):
+                total += _approx_token_count(str(block))
+                continue
+
+            block_type = block.get("type")
+            if block_type == "text":
+                total += _approx_token_count(str(block.get("text", "")))
+            elif block_type == "thinking":
+                total += _approx_token_count(str(block.get("thinking", "")))
+            elif block_type == "redacted_thinking":
+                total += 8
+            elif block_type in {"image", "document", "tool_use", "tool_result"}:
+                total += _approx_token_count(json.dumps(block, ensure_ascii=True, separators=(",", ":")))
+            else:
+                total += _approx_token_count(json.dumps(block, ensure_ascii=True, separators=(",", ":")))
+        return total
+
+    if isinstance(content, dict):
+        return _approx_token_count(json.dumps(content, ensure_ascii=True, separators=(",", ":")))
+
+    if content is None:
+        return 0
+
+    return _approx_token_count(str(content))
+
+
+def _count_tokens_for_request(req: Dict[str, Any]) -> int:
+    total = 0
+
+    system = req.get("system")
+    if isinstance(system, str):
+        total += _count_tokens_for_content(system)
+    elif isinstance(system, list):
+        total += _count_tokens_for_content(system)
+
+    messages = req.get("messages", [])
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                total += _count_tokens_for_content(msg)
+                continue
+            total += 4
+            total += _count_tokens_for_content(msg.get("content"))
+
+    tools = req.get("tools")
+    if isinstance(tools, list):
+        total += 2
+        total += _count_tokens_for_content(tools)
+
+    total += _count_tokens_for_content(req.get("thinking"))
+    total += _count_tokens_for_content(req.get("tool_choice"))
+    total += _count_tokens_for_content(req.get("output_config"))
+
+    return total
+
+
+def _read_model_catalog() -> List[Dict[str, Any]]:
+    if not MODELS_FILE.exists():
+        return []
+
+    catalog: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    in_model_list = False
+
+    for raw_line in MODELS_FILE.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        if stripped == "model_list:":
+            in_model_list = True
+            continue
+
+        if not in_model_list:
+            continue
+
+        if stripped.startswith("- model_name:"):
+            if current is not None:
+                catalog.append(current)
+            current = {"id": stripped.split(":", 1)[1].strip()}
+            continue
+
+        if current is None:
+            continue
+
+        if stripped.startswith("model:"):
+            current["upstream_model"] = stripped.split(":", 1)[1].strip()
+
+    if current is not None:
+        catalog.append(current)
+
+    if not catalog:
+        return []
+
+    created_at = datetime.fromtimestamp(MODELS_FILE.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out: List[Dict[str, Any]] = []
+    for item in catalog:
+        model_id = item.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        pretty_name = re.sub(r"[:_-]+", " ", model_id).strip().title()
+        out.append(
+            {
+                "id": model_id,
+                "type": "model",
+                "display_name": pretty_name,
+                "created_at": created_at,
+                "max_input_tokens": 0,
+                "max_tokens": 0,
+                "capabilities": {
+                    "batch": {"supported": False},
+                    "citations": {"supported": False},
+                    "code_execution": {"supported": False},
+                    "context_management": {"supported": False},
+                    "effort": {
+                        "supported": True,
+                        "low": {"supported": True},
+                        "medium": {"supported": True},
+                        "high": {"supported": True},
+                        "max": {"supported": True},
+                    },
+                    "image_input": {"supported": True},
+                    "pdf_input": {"supported": True},
+                    "structured_outputs": {"supported": False},
+                    "thinking": {
+                        "supported": True,
+                        "types": {
+                            "enabled": {"supported": True},
+                            "adaptive": {"supported": False},
+                        },
+                    },
+                },
+            }
+        )
+
+    return out
+
+
+def _get_model_catalog() -> List[Dict[str, Any]]:
+    catalog = _read_model_catalog()
+    if catalog:
+        return catalog
+
+    return [
+        {
+            "id": "anthropic-proxy-default",
+            "type": "model",
+            "display_name": "Anthropic Proxy Default",
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "max_input_tokens": 0,
+            "max_tokens": 0,
+            "capabilities": {
+                "batch": {"supported": False},
+                "citations": {"supported": False},
+                "code_execution": {"supported": False},
+                "context_management": {"supported": False},
+                "effort": {"supported": True, "low": {"supported": True}, "medium": {"supported": True}, "high": {"supported": True}, "max": {"supported": True}},
+                "image_input": {"supported": True},
+                "pdf_input": {"supported": True},
+                "structured_outputs": {"supported": False},
+                "thinking": {"supported": True, "types": {"enabled": {"supported": True}, "adaptive": {"supported": False}}},
+            },
+        }
+    ]
+
+
+def _find_model(model_id: str) -> Optional[Dict[str, Any]]:
+    for model in _get_model_catalog():
+        if model.get("id") == model_id:
+            return model
+    return None
 
 
 # ----------------------------------------------
@@ -383,7 +608,7 @@ def _safe_json_loads(raw: str) -> Any:
         return {"raw": raw}
 
 
-def _extract_reasoning_blocks(msg: Dict[str, Any], require_signed_thinking: bool) -> List[Dict[str, Any]]:
+def _extract_reasoning_blocks(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
     fallback_signature = msg.get("reasoning_signature")
     if not isinstance(fallback_signature, str):
@@ -393,8 +618,6 @@ def _extract_reasoning_blocks(msg: Dict[str, Any], require_signed_thinking: bool
         if not isinstance(text, str) or not text.strip():
             return
         sig = signature if isinstance(signature, str) else ""
-        if require_signed_thinking and not sig:
-            return
         blocks.append({"type": "thinking", "thinking": text, "signature": sig})
 
     def append_redacted(data: Any) -> None:
@@ -432,30 +655,63 @@ def _extract_reasoning_blocks(msg: Dict[str, Any], require_signed_thinking: bool
 def _openai_to_anthropic_response(
     openai_resp: Dict[str, Any],
     model_name: str,
-    require_signed_thinking: bool,
 ) -> Dict[str, Any]:
     choices = openai_resp.get("choices", [])
     if not choices:
         raise HTTPException(status_code=502, detail="Upstream response had no choices")
 
-    msg = choices[0].get("message", {})
-    finish_reason = choices[0].get("finish_reason", "stop")
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    msg = choice.get("message", {}) if isinstance(choice.get("message", {}), dict) else {}
+    finish_reason = choice.get("finish_reason", "stop")
     content_blocks: List[Dict[str, Any]] = []
+    found_reasoning = False
 
-    content_blocks.extend(_extract_reasoning_blocks(msg, require_signed_thinking))
+    text_parts: List[str] = []
+    raw_content = msg.get("content")
+    if isinstance(raw_content, list):
+        for part in raw_content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                text_value = part.get("text", "")
+                if isinstance(text_value, str) and text_value:
+                    text_parts.append(text_value)
+            elif part_type == "thinking":
+                found_reasoning = True
+                content_blocks.append(
+                    {
+                        "type": "thinking",
+                        "thinking": str(part.get("thinking", part.get("text", ""))),
+                        "signature": str(part.get("signature", msg.get("reasoning_signature", "")) or ""),
+                    }
+                )
+            elif part_type == "redacted_thinking":
+                found_reasoning = True
+                data = part.get("data") or part.get("encrypted") or part.get("ciphertext")
+                if isinstance(data, str) and data:
+                    content_blocks.append({"type": "redacted_thinking", "data": data})
+            elif part_type == "tool_use":
+                fn = part.get("name")
+                if not isinstance(fn, str):
+                    fn = "tool"
+                content_blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": part.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                        "caller": {"type": "direct"},
+                        "name": fn,
+                        "input": _safe_json_loads(part.get("input", {})),
+                    }
+                )
+    elif isinstance(raw_content, str) and raw_content:
+        text_parts.append(raw_content)
 
-    text = msg.get("content")
-    if isinstance(text, list):
-        joined = []
-        for part in text:
-            if isinstance(part, dict) and part.get("type") == "text":
-                joined.append(part.get("text", ""))
-            elif isinstance(part, str):
-                joined.append(part)
-        text = "\n".join([p for p in joined if p])
+    if not found_reasoning:
+        content_blocks.extend(_extract_reasoning_blocks(msg))
 
-    if isinstance(text, str) and text:
-        content_blocks.append({"type": "text", "text": text})
+    if text_parts:
+        content_blocks.append({"type": "text", "text": "\n".join(text_parts)})
 
     tool_calls = msg.get("tool_calls", []) or []
     for tc in tool_calls:
@@ -470,38 +726,19 @@ def _openai_to_anthropic_response(
             }
         )
 
-    usage = openai_resp.get("usage", {}) or {}
-    input_tokens = int(usage.get("prompt_tokens", 0) or 0)
-    output_tokens = int(usage.get("completion_tokens", 0) or 0)
+    usage = _usage_from_upstream(openai_resp.get("usage", {}))
+    stop_sequence = _extract_stop_sequence(openai_resp, choice)
+    had_tool_calls = bool(tool_calls) or any(block.get("type") == "tool_use" for block in content_blocks)
 
     return {
         "id": openai_resp.get("id", f"gen-{uuid.uuid4()}"),
         "type": "message",
         "role": "assistant",
-        "container": None,
         "content": content_blocks or [{"type": "text", "text": ""}],
         "model": model_name,
-        "stop_reason": _finish_reason_to_stop_reason(finish_reason, bool(tool_calls)),
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": None,
-            "cache_read_input_tokens": 0,
-            "cache_creation": None,
-            "inference_geo": None,
-            "server_tool_use": None,
-            "service_tier": None,
-            "speed": "standard",
-            "cost": 0,
-            "is_byok": False,
-            "cost_details": {
-                "upstream_inference_cost": 0,
-                "upstream_inference_prompt_cost": 0,
-                "upstream_inference_completions_cost": 0,
-            },
-        },
-        "provider": openai_resp.get("provider", None),
+        "stop_reason": _finish_reason_to_stop_reason(str(finish_reason or "stop"), had_tool_calls),
+        "stop_sequence": stop_sequence,
+        "usage": usage,
     }
 
 
@@ -607,7 +844,6 @@ def _extract_stream_delta_reasoning(delta: Dict[str, Any]) -> Tuple[str, str, st
 async def _stream_litellm_to_anthropic(
     payload: Dict[str, Any],
     model_name: str,
-    require_signed_thinking: bool,
 ) -> AsyncIterator[bytes]:
     headers = {
         "Content-Type": "application/json",
@@ -650,18 +886,6 @@ async def _stream_litellm_to_anthropic(
                     "output_tokens": 0,
                     "cache_creation_input_tokens": None,
                     "cache_read_input_tokens": 0,
-                    "cache_creation": None,
-                    "inference_geo": None,
-                    "server_tool_use": None,
-                    "service_tier": None,
-                    "speed": "standard",
-                    "cost": 0,
-                    "is_byok": False,
-                    "cost_details": {
-                        "upstream_inference_cost": 0,
-                        "upstream_inference_prompt_cost": 0,
-                        "upstream_inference_completions_cost": 0,
-                    },
                 }
 
                 next_content_index = 0
@@ -670,9 +894,11 @@ async def _stream_litellm_to_anthropic(
                 active_redacted_index: Optional[int] = None
                 pending_thinking_text = ""
                 tool_blocks: Dict[int, Dict[str, Any]] = {}
+                tool_argument_buffers: Dict[int, str] = {}
                 had_tool_calls = False
                 started = False
                 data_lines: List[str] = []
+                stop_sequence: Optional[str] = None
 
                 async def close_text_block() -> AsyncIterator[bytes]:
                     nonlocal active_text_index
@@ -716,7 +942,6 @@ async def _stream_litellm_to_anthropic(
                                     "id": message_id,
                                     "type": "message",
                                     "role": "assistant",
-                                    "container": None,
                                     "content": [],
                                     "model": model_name,
                                     "stop_reason": None,
@@ -725,14 +950,8 @@ async def _stream_litellm_to_anthropic(
                                         "input_tokens": 0,
                                         "output_tokens": 0,
                                         "cache_creation_input_tokens": None,
-                                        "cache_read_input_tokens": None,
-                                        "cache_creation": None,
-                                        "inference_geo": None,
-                                        "server_tool_use": None,
-                                        "service_tier": None,
-                                        "speed": "standard",
+                                        "cache_read_input_tokens": 0,
                                     },
-                                    "provider": chunk.get("provider"),
                                 },
                             },
                         )
@@ -742,6 +961,10 @@ async def _stream_litellm_to_anthropic(
                     if isinstance(chunk_usage, dict):
                         usage["input_tokens"] = int(chunk_usage.get("prompt_tokens", usage["input_tokens"]) or 0)
                         usage["output_tokens"] = int(chunk_usage.get("completion_tokens", usage["output_tokens"]) or 0)
+                        if chunk_usage.get("cache_creation_input_tokens") is not None:
+                            usage["cache_creation_input_tokens"] = int(chunk_usage.get("cache_creation_input_tokens") or 0)
+                        if chunk_usage.get("cache_read_input_tokens") is not None:
+                            usage["cache_read_input_tokens"] = int(chunk_usage.get("cache_read_input_tokens") or 0)
 
                     choices = chunk.get("choices")
                     if not isinstance(choices, list) or not choices:
@@ -751,6 +974,7 @@ async def _stream_litellm_to_anthropic(
                     finish_reason = choice0.get("finish_reason")
                     if isinstance(finish_reason, str) and finish_reason:
                         stop_reason = _finish_reason_to_stop_reason(finish_reason, had_tool_calls)
+                    stop_sequence = _extract_stop_sequence(chunk, choice0) or stop_sequence
 
                     delta = choice0.get("delta")
                     if not isinstance(delta, dict):
@@ -898,6 +1122,7 @@ async def _stream_litellm_to_anthropic(
                             yield event
 
                         had_tool_calls = True
+                        stop_reason = "tool_use"
                         for tc in tool_deltas:
                             if not isinstance(tc, dict):
                                 continue
@@ -912,9 +1137,11 @@ async def _stream_litellm_to_anthropic(
                                     "index": next_content_index,
                                     "id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
                                     "name": function.get("name") or "tool",
+                                    "input": {},
                                 }
                                 tool_blocks[oai_index] = block
                                 next_content_index += 1
+                                tool_argument_buffers.setdefault(oai_index, "")
 
                                 yield _sse(
                                     "content_block_start",
@@ -938,6 +1165,8 @@ async def _stream_litellm_to_anthropic(
 
                             arguments_piece = function.get("arguments")
                             if isinstance(arguments_piece, str) and arguments_piece:
+                                tool_argument_buffers[oai_index] = tool_argument_buffers.get(oai_index, "") + arguments_piece
+                                block["input"] = _safe_json_loads(tool_argument_buffers[oai_index])
                                 yield _sse(
                                     "content_block_delta",
                                     {
@@ -983,9 +1212,8 @@ async def _stream_litellm_to_anthropic(
                     {
                         "type": "message_delta",
                         "delta": {
-                            "container": None,
                             "stop_reason": stop_reason,
-                            "stop_sequence": None,
+                            "stop_sequence": stop_sequence,
                         },
                         "usage": usage,
                     },
@@ -1005,7 +1233,7 @@ async def _stream_litellm_to_anthropic(
     raise HTTPException(status_code=502, detail="Upstream request failed")
 
 
-def _stream_events_from_message(msg: Dict[str, Any], require_signed_thinking: bool) -> Iterable[bytes]:
+def _stream_events_from_message(msg: Dict[str, Any]) -> Iterable[bytes]:
     message_start = {
         "type": "message_start",
         "message": {
@@ -1021,14 +1249,8 @@ def _stream_events_from_message(msg: Dict[str, Any], require_signed_thinking: bo
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "cache_creation_input_tokens": None,
-                "cache_read_input_tokens": None,
-                "cache_creation": None,
-                "inference_geo": None,
-                "server_tool_use": None,
-                "service_tier": None,
-                "speed": "standard",
+                "cache_read_input_tokens": 0,
             },
-            "provider": msg.get("provider"),
         },
     }
     yield _sse("message_start", message_start)
@@ -1037,8 +1259,6 @@ def _stream_events_from_message(msg: Dict[str, Any], require_signed_thinking: bo
         btype = block.get("type")
         if btype == "thinking":
             signature = block.get("signature") if isinstance(block.get("signature"), str) else ""
-            if require_signed_thinking and not signature:
-                continue
             yield _sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "thinking", "thinking": "", "signature": signature}})
             yield _sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "thinking_delta", "thinking": block.get("thinking", "")}})
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
@@ -1080,7 +1300,6 @@ def _stream_events_from_message(msg: Dict[str, Any], require_signed_thinking: bo
         {
             "type": "message_delta",
             "delta": {
-                "container": None,
                 "stop_reason": msg.get("stop_reason"),
                 "stop_sequence": msg.get("stop_sequence"),
             },
@@ -1106,21 +1325,24 @@ async def messages(
     user_agent: Optional[str] = Header(default=None),
 ) -> Any:
     # Headers kept for Anthropic compatibility; adapter currently ignores version/beta flags.
-    _ = anthropic_version
+    _require_anthropic_version(anthropic_version)
     _validate_adapter_auth(x_api_key, authorization)
 
     body = await request.json()
     body["model"] = _resolve_model(body.get("model", ""))
 
-    # Force thinking for every request, regardless of client or user-agent.
-    body["thinking"] = {
-        "type": "enabled",
-        "budget_tokens": FORCE_THINKING_BUDGET_TOKENS,
-    }
-    forced_thinking = True
+    max_tokens = body.get("max_tokens", 1024)
+    try:
+        max_tokens_int = int(max_tokens)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="max_tokens must be a positive integer")
+    if max_tokens_int <= 0:
+        raise HTTPException(status_code=400, detail="max_tokens must be greater than 0")
+    body["max_tokens"] = max_tokens_int
+
+    require_signed_thinking = _should_require_signed_thinking(body, user_agent)
 
     request_id = uuid.uuid4().hex[:12]
-    require_signed_thinking = _should_require_signed_thinking(body, user_agent)
     LOGGER.info(
         "messages.request %s",
         json.dumps(
@@ -1128,17 +1350,11 @@ async def messages(
                 "request_id": request_id,
                 "model": body.get("model"),
                 "stream": bool(body.get("stream")),
-                "thinking_requested": _thinking_requested(body),
-                "thinking_budget_tokens": (body.get("thinking") or {}).get("budget_tokens") if isinstance(body.get("thinking"), dict) else None,
                 "message_count": len(body.get("messages", [])) if isinstance(body.get("messages"), list) else 0,
                 "content_types": _collect_message_content_types(body.get("messages")),
                 "tools_count": len(body.get("tools", [])) if isinstance(body.get("tools"), list) else 0,
                 "anthropic_beta": anthropic_beta,
                 "user_agent": (user_agent or "")[:160],
-                "forced_thinking": forced_thinking,
-                "force_thinking_for_all_requests": FORCE_THINKING_FOR_ALL_REQUESTS,
-                "force_thinking_user_agents": FORCE_THINKING_USER_AGENTS,
-                "strict_signed_thinking_default": STRICT_SIGNED_THINKING,
                 "require_signed_thinking": require_signed_thinking,
             },
             ensure_ascii=True,
@@ -1165,16 +1381,17 @@ async def messages(
     if openai_tool_choice is not None:
         payload["tool_choice"] = openai_tool_choice
 
-    reasoning_effort = _reasoning_effort(body)
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
+    if body.get("thinking"):
+        reasoning_effort = _reasoning_effort(body)
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
 
     if body.get("stream"):
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
         try:
             return StreamingResponse(
-                _stream_litellm_to_anthropic(payload, body["model"], require_signed_thinking),
+                _stream_litellm_to_anthropic(payload, body["model"]),
                 media_type="text/event-stream",
             )
         except UpstreamError as exc:
@@ -1186,7 +1403,7 @@ async def messages(
     except UpstreamError as exc:
         return _error_response(exc.status_code, exc.body)
 
-    anthropic_msg = _openai_to_anthropic_response(upstream, body["model"], require_signed_thinking)
+    anthropic_msg = _openai_to_anthropic_response(upstream, body["model"])
     LOGGER.info(
         "messages.response %s",
         json.dumps(
@@ -1205,3 +1422,95 @@ async def messages(
     )
 
     return anthropic_msg
+
+
+@app.get("/v1/models")
+def list_models(
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    anthropic_version: Optional[str] = Header(default=None),
+    anthropic_beta: Optional[str] = Header(default=None),
+    after_id: Optional[str] = Query(default=None),
+    before_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=1000),
+) -> Dict[str, Any]:
+    _ = anthropic_beta
+    _require_anthropic_version(anthropic_version)
+    _validate_adapter_auth(x_api_key, authorization)
+
+    models = _get_model_catalog()
+    start = 0
+    end = len(models)
+
+    if after_id:
+        for index, model in enumerate(models):
+            if model.get("id") == after_id:
+                start = index + 1
+                break
+
+    if before_id:
+        for index, model in enumerate(models):
+            if model.get("id") == before_id:
+                end = index
+                break
+
+    if before_id and after_id:
+        page = models[start:end][:limit]
+    elif before_id:
+        page = models[max(0, end - limit):end]
+    elif after_id:
+        page = models[start:start + limit]
+    else:
+        page = models[:limit]
+
+    has_more = False
+    if page:
+        last_index = models.index(page[-1])
+        has_more = last_index < len(models) - 1
+
+    return {
+        "data": page,
+        "first_id": page[0]["id"] if page else "",
+        "has_more": has_more,
+        "last_id": page[-1]["id"] if page else "",
+    }
+
+
+@app.get("/v1/models/{model_id}")
+def get_model(
+    model_id: str,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    anthropic_version: Optional[str] = Header(default=None),
+    anthropic_beta: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _ = anthropic_beta
+    _require_anthropic_version(anthropic_version)
+    _validate_adapter_auth(x_api_key, authorization)
+
+    model = _find_model(model_id)
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    return model
+
+
+@app.post("/v1/messages/count_tokens")
+async def count_tokens(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    anthropic_version: Optional[str] = Header(default=None),
+    anthropic_beta: Optional[str] = Header(default=None),
+) -> Dict[str, int]:
+    _ = anthropic_beta
+    _require_anthropic_version(anthropic_version)
+    _validate_adapter_auth(x_api_key, authorization)
+
+    body = await request.json()
+    body["model"] = _resolve_model(body.get("model", ""))
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="messages must be an array")
+
+    return {"input_tokens": _count_tokens_for_request(body)}
