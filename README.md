@@ -66,6 +66,7 @@ docker compose ps
 |----------|-------------|----------|
 | `LITELLM_MASTER_KEY` | Master API key for authentication | Yes |
 | `LITELLM_SALT_KEY` | Salt key for encryption | Yes |
+| `ANTHROPIC_PROXY_STRICT_API_KEY` | When `true`, adapter only accepts `ANTHROPIC_PROXY_API_KEY`; keep `false` to allow LiteLLM virtual keys | No |
 | `DATABASE_URL` | PostgreSQL connection string | No (auto-configured) |
 
 ### Model Configuration
@@ -257,6 +258,8 @@ curl http://localhost:8080/health
 **Connection Refused**: Ensure services are running with `docker compose ps`
 
 **Authentication Failed**: Verify `LITELLM_MASTER_KEY` in your `.env` file
+
+**Virtual Key Unauthorized**: Set `ANTHROPIC_PROXY_STRICT_API_KEY=false` (default) so the adapter forwards caller keys to LiteLLM for virtual-key validation.
 
 **Platform Mismatch (`linux/amd64` vs `linux/arm64`)**:
 The `litellm` service defaults to `linux/amd64` in `compose.yml` for compatibility on ARM hosts.
