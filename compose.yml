@@ -31,7 +31,7 @@ services:
 
   anthropic-adapter:
     build:
-      context: ./anthropic_proxy
+      context: ./proxy
       dockerfile: Dockerfile
     container_name: anthropic-adapter
     depends_on:

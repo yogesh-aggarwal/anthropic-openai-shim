@@ -36,7 +36,7 @@ _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-LOGGER = logging.getLogger("anthropic_proxy")
+LOGGER = logging.getLogger("proxy")
 
 
 class UpstreamError(Exception):
