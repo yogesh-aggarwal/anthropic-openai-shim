@@ -9,3 +9,5 @@ providers.yaml
 models.yaml
 models.names.yaml
 models.config.yaml
+
+opencode.json

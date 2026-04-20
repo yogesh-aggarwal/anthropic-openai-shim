@@ -18,3 +18,4 @@ logs:
 
 models:
 	@python scripts/models.py
+	@python scripts/models_opencode.py
