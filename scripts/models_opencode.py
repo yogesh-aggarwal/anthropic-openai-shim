@@ -22,7 +22,23 @@ def main() -> None:
         name = model_info.get("name")
 
         if model_id and name:
-            models_dict[model_id] = {"name": name}
+            models_dict[model_id] = {
+                "name": name,
+                "variants": {
+                    "low": {
+                        "reasoningEffort": "low",
+                        "textVerbosity": "low",
+                    },
+                    "medium": {
+                        "reasoningEffort": "medium",
+                        "textVerbosity": "low",
+                    },
+                    "high": {
+                        "reasoningEffort": "high",
+                        "textVerbosity": "low",
+                    },
+                },
+            }
 
     output = {"models": models_dict}
 
