@@ -54,6 +54,27 @@ def final_model_name(model_id: str) -> str:
     return name
 
 
+def generate_model_display_name(model_id: str) -> str:
+    """Generate display name from model ID using naming rules.
+
+    1. Replace all - with spaces
+    2. For each word: if alphabet count <= 2, uppercase the whole word;
+       otherwise capitalize just the first letter
+    """
+    slug = final_model_name(model_id)
+    words = slug.replace("-", " ").split()
+
+    result_words = []
+    for word in words:
+        alpha_count = sum(1 for c in word if c.isalpha())
+        if alpha_count <= 2:
+            result_words.append(word.upper())
+        else:
+            result_words.append(word.capitalize())
+
+    return " ".join(result_words)
+
+
 def fetch_openrouter_models(api_key: str) -> list[dict]:
     """Fetch all models from OpenRouter and return parsed model data."""
     resp = httpx.get(
@@ -237,8 +258,11 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
     return results, or_lookup
 
 
-def convert_models(config: dict, or_lookup: dict, output_path: str) -> None:
+def convert_models(config: dict, or_lookup: dict, output_path: str, name_overrides: dict | None = None) -> None:
     """Convert models.config dict to models.yaml format with OpenRouter metadata."""
+    if name_overrides is None:
+        name_overrides = {}
+
     grouped = defaultdict(list)
 
     for provider, info in config.items():
@@ -310,6 +334,11 @@ def convert_models(config: dict, or_lookup: dict, output_path: str) -> None:
         model_info["input_cost_per_token"] = CostValue(0.000003)
         model_info["output_cost_per_token"] = CostValue(0.000015)
 
+        if unique_id in name_overrides:
+            model_info["name"] = name_overrides[unique_id]
+        else:
+            model_info["name"] = generate_model_display_name(unique_id)
+
         model_entry = {
             "model_name": unique_id,
             "litellm_params": litellm_params,
@@ -330,9 +359,18 @@ def main() -> None:
     providers_file = script_dir / "providers.yaml"
     config_file = script_dir / "models.config.yaml"
     output_file = script_dir / "models.yaml"
+    names_file = script_dir / "models.names.yaml"
 
     with open(providers_file) as f:
         providers = yaml.safe_load(f)
+
+    name_overrides = {}
+    if names_file.exists():
+        with open(names_file) as f:
+            data = yaml.safe_load(f)
+            if data:
+                for key, value in data.items():
+                    name_overrides[key] = value
 
     config, or_lookup = discover_free_models(providers)
 
@@ -341,7 +379,7 @@ def main() -> None:
 
     print(f"\nWrote models.config.yaml with {len(config)} providers")
 
-    convert_models(config, or_lookup, str(output_file))
+    convert_models(config, or_lookup, str(output_file), name_overrides)
     print("Converted models ✌️")
 
 
