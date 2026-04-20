@@ -155,7 +155,18 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
     all_openrouter_models = list(openrouter_models_by_id.values())
     print(f"  Found {len(all_openrouter_models)} total models")
 
-    free_models = [m for m in all_openrouter_models if "free" in m["id"].lower()]
+    free_models = [
+        m
+        for m in all_openrouter_models
+        if
+        # id contains the word "free"
+        "free" in m["id"].lower()
+        # or pricing is explicitly 0 for both prompt and completion
+        or (
+            m.get("pricing", {}).get("prompt", None) == "0"
+            and m.get("pricing", {}).get("completion", None) == "0"
+        )
+    ]
     free_model_ids = [m["id"] for m in free_models]
     or_lookup = build_openrouter_lookup(all_openrouter_models)
     print(f"  {len(free_model_ids)} free models")
@@ -200,7 +211,12 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
         matched = []
         for model in provider_models:
             provider_model_id = model["id"]
-            if "free" in provider_model_id.lower():
+            if (  # id contains the word "free"
+                "free" in provider_model_id.lower()
+            ) or (  # or pricing is explicitly 0 for both prompt and completion
+                model.get("pricing", {}).get("prompt", None) == "0"
+                and model.get("pricing", {}).get("completion", None) == "0"
+            ):
                 matched.append(f"{prefix}/{provider_model_id}")
                 continue
 
