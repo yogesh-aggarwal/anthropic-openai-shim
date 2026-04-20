@@ -13,6 +13,7 @@ import httpx
 import itertools
 import yaml
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
@@ -193,29 +194,28 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
     print(f"  {len(free_model_ids)} free models")
 
     results: dict = {}
+    results["openrouter"] = {
+        "base": providers["openrouter"]["base"],
+        "models": sorted(f"{openrouter_prefix}/{m}" for m in free_model_ids),
+        "keys": providers["openrouter"]["keys"],
+    }
 
-    for provider_name, info in providers.items():
+    def check_provider(provider_name: str, info: dict) -> tuple[str, dict | None]:
         base = info.get("base", "")
         keys = info.get("keys", [])
         explicit_models = info.get("models")
 
         if explicit_models:
-            results[provider_name] = info
-            continue
+            return provider_name, info
 
         if not base or not keys:
             print(f"Skipping {provider_name}: no base or keys")
-            continue
+            return provider_name, None
 
         prefix = info.get("prefix", "openai")
 
         if provider_name == "openrouter":
-            results[provider_name] = {
-                "base": base,
-                "models": sorted(f"{openrouter_prefix}/{m}" for m in free_model_ids),
-                "keys": keys,
-            }
-            continue
+            return provider_name, None
 
         print(f"Checking {provider_name} against OpenRouter free models ...")
         provider_models_by_id: dict[str, dict] = {}
@@ -246,14 +246,37 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
                 matched.append(f"{prefix}/{match}")
 
         if matched:
-            results[provider_name] = {
+            result = {
                 "base": base,
                 "models": sorted(set(matched)),
                 "keys": keys,
             }
             print(f"  {len(matched)} matching free models")
+            return provider_name, result
         else:
             print("  No matching free models")
+            return provider_name, None
+
+    providers_to_check = [
+        (name, info)
+        for name, info in providers.items()
+        if name != "openrouter" and not info.get("models")
+    ]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(check_provider, name, info): name
+            for name, info in providers_to_check
+        }
+
+        for future in as_completed(futures):
+            provider_name, result = future.result()
+            if result is not None:
+                results[provider_name] = result
+
+    for name, info in providers.items():
+        if info.get("models"):
+            results[name] = info
 
     return results, or_lookup
 
