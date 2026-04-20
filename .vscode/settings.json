@@ -6,7 +6,9 @@
     "**/.DS_Store": true,
     "**/Thumbs.db": true,
     "**/__pycache__": true,
-    "**/.vscode": true
+    "**/.vscode": true,
+    "**/.ruff_cache": true,
+    "**/.venv": true,
   },
   "explorer.fileNesting.enabled": true,
   "explorer.fileNesting.patterns": {
@@ -14,5 +16,5 @@
     "litellm_config.yaml": "Makefile, .gitignore, *.yml",
     "providers.yaml": "models.yaml, models.*.yaml",
   },
-  "python-envs.defaultEnvManager": "ms-python.python:pyenv"
+  "python-envs.defaultEnvManager": "ms-python.python:venv"
 }
