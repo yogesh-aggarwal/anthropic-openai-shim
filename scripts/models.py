@@ -15,8 +15,13 @@ import yaml
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from rich.console import Console
+from rich.live import Live
+from rich.text import Text
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+console = Console(force_terminal=True)
 
 
 class CostValue:
@@ -73,7 +78,10 @@ def generate_model_display_name(model_id: str) -> str:
         else:
             result_words.append(word.capitalize())
 
-    return " ".join(result_words)
+    final =  " ".join(result_words)
+    if final.endswith(" IT"):
+        final = final.rpartition(" IT")[0]
+    return final
 
 
 def fetch_openrouter_models(api_key: str) -> list[dict]:
@@ -164,18 +172,18 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
     openrouter_keys = openrouter_info.get("keys", [])
     openrouter_prefix = openrouter_info.get("prefix", "openrouter")
 
-    print("Fetching models from OpenRouter ...")
+    console.print("[bold blue]Fetching models from OpenRouter...[/]")
     openrouter_models_by_id: dict[str, dict] = {}
     for key in openrouter_keys:
         try:
             for model in fetch_openrouter_models(key):
                 openrouter_models_by_id[model["id"]] = model
         except Exception as e:
-            print(f"  Key failed: {e}")
+            console.print(f"  [red]Key failed: {e}[/]")
             continue
 
     all_openrouter_models = list(openrouter_models_by_id.values())
-    print(f"  Found {len(all_openrouter_models)} total models")
+    console.print(f"  [green]Found {len(all_openrouter_models)} total models[/]")
 
     free_models = [
         m
@@ -191,7 +199,7 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
     ]
     free_model_ids = [m["id"] for m in free_models]
     or_lookup = build_openrouter_lookup(all_openrouter_models)
-    print(f"  {len(free_model_ids)} free models")
+    console.print(f"  [cyan]{len(free_model_ids)} free models[/]")
 
     results: dict = {}
     results["openrouter"] = {
@@ -200,31 +208,29 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
         "keys": providers["openrouter"]["keys"],
     }
 
-    def check_provider(provider_name: str, info: dict) -> tuple[str, dict | None]:
+    def check_provider(provider_name: str, info: dict) -> tuple[str, dict | None, int]:
         base = info.get("base", "")
         keys = info.get("keys", [])
         explicit_models = info.get("models")
 
         if explicit_models:
-            return provider_name, info
+            return provider_name, info, len(explicit_models) if isinstance(explicit_models, list) else 0
 
         if not base or not keys:
-            print(f"Skipping {provider_name}: no base or keys")
-            return provider_name, None
+            console.print(f"[yellow]Skipping {provider_name}: no base or keys[/]")
+            return provider_name, None, 0
 
         prefix = info.get("prefix", "openai")
 
         if provider_name == "openrouter":
-            return provider_name, None
+            return provider_name, None, 0
 
-        print(f"Checking {provider_name} against OpenRouter free models ...")
         provider_models_by_id: dict[str, dict] = {}
         for key in keys:
             try:
                 for model in fetch_provider_model_data(base, key):
                     provider_models_by_id[model["id"]] = model
-            except Exception as e:
-                print(f"  Key failed: {e}")
+            except Exception:
                 continue
 
         provider_models = list(provider_models_by_id.values())
@@ -251,11 +257,9 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
                 "models": sorted(set(matched)),
                 "keys": keys,
             }
-            print(f"  {len(matched)} matching free models")
-            return provider_name, result
+            return provider_name, result, len(matched)
         else:
-            print("  No matching free models")
-            return provider_name, None
+            return provider_name, None, 0
 
     providers_to_check = [
         (name, info)
@@ -263,16 +267,44 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
         if name != "openrouter" and not info.get("models")
     ]
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {
-            executor.submit(check_provider, name, info): name
-            for name, info in providers_to_check
-        }
+    status_updates = {}
 
-        for future in as_completed(futures):
-            provider_name, result = future.result()
-            if result is not None:
-                results[provider_name] = result
+    def render_todo():
+        parts = []
+        for name, _ in providers_to_check:
+            status_text, count_val = status_updates.get(name, (None, 0))
+            if status_text is None:
+                parts.append(f"[yellow]○[/] {name}\t[yellow dim]Fetching...[/]")
+            elif count_val > 0:
+                parts.append(f"[green]✓[/] {name}\t[green]{count_val} models[/]")
+            else:
+                parts.append(f"[dim]✗[/] {name}\t[dim]No matches[/]")
+
+        output = Text()
+        for i, part in enumerate(parts):
+            if i > 0:
+                output.append("\n")
+            output.append(Text.from_markup(part))
+        return output
+
+    console.print()
+    with Live(render_todo(), console=console, refresh_per_second=4) as live:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(check_provider, name, info): name
+                for name, info in providers_to_check
+            }
+
+            for future in as_completed(futures):
+                provider_name, result, count = future.result()
+                if result is not None:
+                    results[provider_name] = result
+                    status = f"[green]✓ {count} models[/]"
+                else:
+                    status = "[dim]No matches[/]"
+                status_updates[provider_name] = (status, count)
+
+                live.update(render_todo())
 
     for name, info in providers.items():
         if info.get("models"):
@@ -400,10 +432,10 @@ def main() -> None:
     with open(config_file, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
-    print(f"\nWrote models.config.yaml with {len(config)} providers")
+    console.print(f"\n[bold green]Wrote models.config.yaml with {len(config)} providers[/]")
 
     convert_models(config, or_lookup, str(output_file), name_overrides)
-    print("Converted models ✌️")
+    console.print("[bold green]Converted models ✌️[/]")
 
 
 if __name__ == "__main__":
