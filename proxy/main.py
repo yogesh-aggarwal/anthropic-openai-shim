@@ -898,7 +898,23 @@ async def _stream_litellm_to_anthropic(
                         body: Any = json.loads(raw.decode("utf-8"))
                     except Exception:
                         body = {"error": {"message": raw.decode("utf-8", errors="replace"), "code": resp.status_code}}
-                    raise UpstreamError(resp.status_code, body)
+                    # Build Anthropic-compatible error event payload
+                    err_type = "api_error"
+                    if resp.status_code in (400, 422):
+                        err_type = "invalid_request_error"
+                    elif resp.status_code == 401:
+                        err_type = "authentication_error"
+                    elif resp.status_code == 403:
+                        err_type = "permission_error"
+                    elif resp.status_code == 404:
+                        err_type = "not_found_error"
+                    elif resp.status_code == 429:
+                        err_type = "rate_limit_error"
+                    error_msg = _extract_error_message(body)
+                    sse_payload = json.dumps({"type": "error", "error": {"message": error_msg, "type": err_type}}).encode("utf-8")
+                    yield b"event: error\ndata: " + sse_payload + b"\n\n"
+                    yield b"event: data\ndata: [DONE]\n\n"
+                    return
 
                 message_id: Optional[str] = None
                 stop_reason = "end_turn"
@@ -1193,52 +1209,68 @@ async def _stream_litellm_to_anthropic(
                                         "delta": {"type": "input_json_delta", "partial_json": arguments_piece},
                                     },
                                 )
+                            elif arguments_piece is None or (isinstance(arguments_piece, str) and not arguments_piece.strip()):
+                                # Empty/missing arguments means tool call complete — flush accumulated buffer
+                                block["input"] = _safe_json_loads(tool_argument_buffers.get(oai_index, "{}"))
+                                # No delta emitted — upstream sent no new data
 
-                async for line in resp.aiter_lines():
-                    if line is None:
-                        continue
+                try:
+                    async for line in resp.aiter_lines():
+                        if line is None:
+                            continue
 
-                    raw_line = line.rstrip("\r")
-                    if raw_line == "":
-                        if data_lines:
-                            raw_data = "\n".join(data_lines)
-                            data_lines = []
-                            async for event in emit_from_data(raw_data):
-                                yield event
-                        continue
+                        raw_line = line.rstrip("\r")
+                        if raw_line == "":
+                            if data_lines:
+                                raw_data = "\n".join(data_lines)
+                                data_lines = []
+                                async for event in emit_from_data(raw_data):
+                                    yield event
+                            continue
 
-                    if raw_line.startswith("data:"):
-                        data_lines.append(raw_line[5:].strip())
+                        if raw_line.startswith("data:"):
+                            data_lines.append(raw_line[5:].strip())
 
-                if data_lines:
-                    raw_data = "\n".join(data_lines)
-                    async for event in emit_from_data(raw_data):
+                    if data_lines:
+                        raw_data = "\n".join(data_lines)
+                        data_lines = []
+                        async for event in emit_from_data(raw_data):
+                            yield event
+
+                    async for event in close_text_block():
+                        yield event
+                    async for event in close_thinking_block():
+                        yield event
+                    async for event in close_redacted_block():
                         yield event
 
-                async for event in close_text_block():
-                    yield event
-                async for event in close_thinking_block():
-                    yield event
-                async for event in close_redacted_block():
-                    yield event
+                    # Close all open tool_use blocks in reverse order (LIFO)
+                    for block in reversed(list(tool_blocks.values())):
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block["index"]})
 
-                for block in tool_blocks.values():
-                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": block["index"]})
-
-                yield _sse(
-                    "message_delta",
-                    {
-                        "type": "message_delta",
-                        "delta": {
-                            "stop_reason": stop_reason,
-                            "stop_sequence": stop_sequence,
+                    yield _sse(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {
+                                "stop_reason": stop_reason,
+                                "stop_sequence": stop_sequence,
+                            },
+                            "usage": usage,
                         },
-                        "usage": usage,
-                    },
-                )
-                yield _sse("message_stop", {"type": "message_stop"})
-                yield b"event: data\ndata: [DONE]\n\n"
-                return
+                    )
+                    yield _sse("message_stop", {"type": "message_stop"})
+                    yield b"event: data\ndata: [DONE]\n\n"
+                    return
+                except Exception as e:
+                    LOGGER.error("Streaming error: %s", e, exc_info=True)
+                    sse_payload = json.dumps({
+                        "type": "error",
+                        "error": {"message": "Internal streaming error", "type": "api_error"}
+                    }).encode("utf-8")
+                    yield b"event: error\ndata: " + sse_payload + b"\n\n"
+                    yield b"event: data\ndata: [DONE]\n\n"
+                    return
         except UpstreamError:
             raise
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
