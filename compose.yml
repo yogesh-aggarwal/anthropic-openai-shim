@@ -16,34 +16,17 @@ services:
     container_name: litellm-proxy
     depends_on:
       - postgres
-      - proxy-rotator
     env_file:
       - .env
     environment:
       DATABASE_URL: postgresql://litellm:litellm@postgres:5432/litellm
       STORE_MODEL_IN_DB: "True"
-      HTTP_PROXY: http://proxy-rotator:3128
-      HTTPS_PROXY: http://proxy-rotator:3128
-      NO_PROXY: localhost,127.0.0.1,postgres,litellm,proxy-rotator
     ports:
       - "8080:4000"
     volumes:
       - ./litellm_config.yaml:/app/config.yaml:ro
       - ./models.yaml:/app/models.yaml:ro
     command: ["--config", "/app/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
-    restart: unless-stopped
-
-  proxy-rotator:
-    build:
-      context: ./proxy_rotator
-      dockerfile: Dockerfile
-    container_name: proxy-rotator
-    env_file:
-      - .env
-    environment:
-      PROXY_POOL: ${PROXY_POOL:-}
-    ports:
-      - "3128:3128"
     restart: unless-stopped
 
   anthropic-adapter:

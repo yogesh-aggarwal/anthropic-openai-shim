@@ -68,16 +68,6 @@ docker compose up -d --build
 docker compose ps
 ```
 
-### 5. Configure Free Proxy Rotation
-
-If you want LiteLLM to use a rotating HTTP(S) proxy pool for outbound provider traffic, set `PROXY_POOL` in your `.env` file:
-
-```env
-PROXY_POOL=http://proxy1.example.com:3128,http://proxy2.example.com:3128
-```
-
-This enables the new `proxy-rotator` service and routes all LiteLLM provider requests through it.
-
 ## 🔧 Configuration
 
 ### Environment Variables
@@ -86,7 +76,6 @@ This enables the new `proxy-rotator` service and routes all LiteLLM provider req
 |----------|-------------|----------|
 | `LITELLM_MASTER_KEY` | Master API key for authentication | Yes |
 | `LITELLM_SALT_KEY` | Salt key for encryption | Yes |
-| `PROXY_POOL` | Comma-separated upstream HTTP(S) proxy URLs for LiteLLM egress | No |
 | `ANTHROPIC_PROXY_STRICT_API_KEY` | When `true`, adapter only accepts `ANTHROPIC_PROXY_API_KEY`; keep `false` to allow LiteLLM virtual keys | No |
 | `DATABASE_URL` | PostgreSQL connection string | No (auto-configured) |
 
