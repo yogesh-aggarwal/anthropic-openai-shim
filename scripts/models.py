@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Discover free models using OpenRouter as source of truth and convert to LiteLLM models.yaml.
+"""Discover free models per-provider and convert to LiteLLM models.yaml.
 
 Pipeline:
 1. Read providers.yaml
-2. Fetch free models from OpenRouter (hardcoded) as the canonical list
-3. For each other provider, fuzzy-match their models against OpenRouter's free list
-4. Write models.config.yaml
-5. Convert models.config.yaml to models.yaml with fallbacks, pricing, and OpenRouter metadata
+2. For each provider, fetch their models and identify free ones locally
+3. Standardize model names (strip provider prefixes, colons, :free suffixes)
+4. Write models.config.yaml with standardized model IDs
+5. Convert models.config.yaml to models.yaml with OpenRouter metadata enrichment
 """
 
 import httpx
@@ -48,6 +48,32 @@ def openrouter_model_id(model_id: str) -> str:
     """
     slug = model_slug(model_id)
     return slug.split(":", 1)[0]
+
+
+def standardize_model_id(provider_prefix: str, model_id: str) -> str:
+    """Standardize a model ID by stripping provider prefix, colons, and :free suffixes.
+
+    This ensures models from different providers with similar names can be
+    grouped together in LiteLLM deployment.
+
+    Example: With provider_prefix="openai", model_id="openai/gpt-4o:free"
+    returns "openai/gpt-4o".
+    """
+    # Start with the full model ID
+    result = model_id
+
+    # Remove provider prefix if present
+    if result.startswith(f"{provider_prefix}/"):
+        result = result[len(provider_prefix) + 1:]
+
+    # Extract the slug part before any colons
+    result = result.split(":", 1)[0]
+
+    # Remove -free suffix
+    if result.endswith("-free"):
+        result = result[: -len("-free")]
+
+    return result
 
 
 def final_model_name(model_id: str) -> str:
@@ -156,15 +182,35 @@ def fuzzy_match(provider_model: str, openrouter_free_ids: list[str]) -> str | No
 
 
 def build_openrouter_lookup(openrouter_models: list[dict]) -> dict[str, dict]:
-    """Build a lookup dict from model ID to full OpenRouter model metadata."""
+    """Build a lookup dict from standardized model name (final_model_name) to OpenRouter metadata."""
     lookup = {}
     for model in openrouter_models:
-        lookup[model["id"]] = model
+        key = final_model_name(model["id"])
+        lookup[key] = model
     return lookup
 
 
+def is_model_free(model: dict, model_id: str) -> bool:
+    """Check if a model is free based on ID or pricing."""
+    model_id_lower = model_id.lower()
+    pricing = model.get("pricing", {})
+
+    # Check if ID contains "free"
+    if "free" in model_id_lower:
+        return True
+
+    # Check if pricing is explicitly 0 for both prompt and completion
+    if (
+        pricing.get("prompt") == "0"
+        and pricing.get("completion") == "0"
+    ):
+        return True
+
+    return False
+
+
 def discover_free_models(providers: dict) -> tuple[dict, dict]:
-    """Use OpenRouter as source of truth for free models, check other providers.
+    """Fetch models from each provider independently and identify free ones.
 
     Returns (config dict, openrouter metadata lookup dict).
     """
@@ -172,7 +218,7 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
     openrouter_keys = openrouter_info.get("keys", [])
     openrouter_prefix = openrouter_info.get("prefix", "openrouter")
 
-    console.print("[bold blue]Fetching models from OpenRouter...[/]")
+    console.print("[bold blue]Fetching OpenRouter models for metadata...[/]")
     openrouter_models_by_id: dict[str, dict] = {}
     for key in openrouter_keys:
         try:
@@ -183,35 +229,34 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
             continue
 
     all_openrouter_models = list(openrouter_models_by_id.values())
-    console.print(f"  [green]Found {len(all_openrouter_models)} total models[/]")
+    console.print(f"  [green]Found {len(all_openrouter_models)} total OpenRouter models[/]")
 
-    free_models = [
-        m
-        for m in all_openrouter_models
-        if
-        # id contains the word "free"
-        "free" in m["id"].lower()
-        # or pricing is explicitly 0 for both prompt and completion
-        or (
-            m.get("pricing", {}).get("prompt", None) == "0"
-            and m.get("pricing", {}).get("completion", None) == "0"
-        )
-    ]
-    free_model_ids = [m["id"] for m in free_models]
+    # Build OpenRouter lookup using standardized names
     or_lookup = build_openrouter_lookup(all_openrouter_models)
-    console.print(f"  [cyan]{len(free_model_ids)} free models[/]")
 
     results: dict = {}
-    results["openrouter"] = {
-        "base": providers["openrouter"]["base"],
-        "models": sorted(f"{openrouter_prefix}/{m}" for m in free_model_ids),
-        "keys": providers["openrouter"]["keys"],
-    }
+
+    # Identify free OpenRouter models and add them to results
+    openrouter_matched = []
+    for model in all_openrouter_models:
+        model_id = model["id"]
+        if is_model_free(model, model_id):
+            standardized = standardize_model_id(openrouter_prefix, model_id)
+            openrouter_matched.append(f"{openrouter_prefix}/{standardized}")
+
+    if openrouter_matched:
+        results["openrouter"] = {
+            "base": providers["openrouter"]["base"],
+            "models": sorted(set(openrouter_matched)),
+            "keys": providers["openrouter"]["keys"],
+        }
+        console.print(f"  [cyan]{len(openrouter_matched)} free OpenRouter models[/]")
 
     def check_provider(provider_name: str, info: dict) -> tuple[str, dict | None, int]:
         base = info.get("base", "")
         keys = info.get("keys", [])
         explicit_models = info.get("models")
+        prefix = info.get("prefix", provider_name)
 
         if explicit_models:
             return provider_name, info, len(explicit_models) if isinstance(explicit_models, list) else 0
@@ -220,11 +265,7 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
             console.print(f"[yellow]Skipping {provider_name}: no base or keys[/]")
             return provider_name, None, 0
 
-        prefix = info.get("prefix", "openai")
-
-        if provider_name == "openrouter":
-            return provider_name, None, 0
-
+        # Fetch all models for this provider
         provider_models_by_id: dict[str, dict] = {}
         for key in keys:
             try:
@@ -234,22 +275,13 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
                 continue
 
         provider_models = list(provider_models_by_id.values())
-
         matched = []
-        for model in provider_models:
-            provider_model_id = model["id"]
-            if (  # id contains the word "free"
-                "free" in provider_model_id.lower()
-            ) or (  # or pricing is explicitly 0 for both prompt and completion
-                model.get("pricing", {}).get("prompt", None) == "0"
-                and model.get("pricing", {}).get("completion", None) == "0"
-            ):
-                matched.append(f"{prefix}/{provider_model_id}")
-                continue
 
-            match = fuzzy_match(provider_model_id, free_model_ids)
-            if match:
-                matched.append(f"{prefix}/{match}")
+        for model in provider_models:
+            model_id = model["id"]
+            if is_model_free(model, model_id):
+                standardized = standardize_model_id(prefix, model_id)
+                matched.append(f"{prefix}/{standardized}")
 
         if matched:
             result = {
@@ -278,7 +310,7 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
             elif count_val > 0:
                 parts.append(f"[green]✓[/] {name}\t[green]{count_val} models[/]")
             else:
-                parts.append(f"[dim]✗[/] {name}\t[dim]No matches[/]")
+                parts.append(f"[dim]✗[/] {name}\t[dim]No free models[/]")
 
         output = Text()
         for i, part in enumerate(parts):
@@ -301,7 +333,7 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
                     results[provider_name] = result
                     status = f"[green]✓ {count} models[/]"
                 else:
-                    status = "[dim]No matches[/]"
+                    status = "[dim]No free models[/]"
                 status_updates[provider_name] = (status, count)
 
                 live.update(render_todo())
@@ -353,9 +385,9 @@ def convert_models(config: dict, or_lookup: dict, output_path: str, name_overrid
 
         model_info: dict = {}
 
-        or_model_id = openrouter_model_id(primary_model)
-        if or_model_id in or_lookup:
-            or_data = or_lookup[or_model_id]
+        # Enrich with OpenRouter metadata if available
+        if unique_id in or_lookup:
+            or_data = or_lookup[unique_id]
             skip_keys = {"id", "pricing"}
             for key, value in or_data.items():
                 if key in skip_keys or value is None:
