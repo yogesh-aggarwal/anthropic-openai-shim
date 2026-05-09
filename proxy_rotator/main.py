@@ -104,12 +104,16 @@ async def handle_proxy(request: web.Request):
                 timeout=aiohttp.ClientTimeout(total=30),
                 allow_redirects=False,
             ) as resp:
+                logger.info(
+                    f"Request: {method} {url} -> Proxy: {proxy_url} [Auth: {auth_header[:8]}...]"
+                )
                 resp_body = await resp.read()
                 resp_headers = {
                     k: v
                     for k, v in resp.headers.items()
                     if k.lower() not in exclude_headers
                 }
+                logger.info(f"Response: {resp.status} for {url} via {proxy_url}")
                 return web.Response(
                     body=resp_body, status=resp.status, headers=resp_headers
                 )
