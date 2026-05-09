@@ -9,7 +9,7 @@ from aiohttp import web
 # Configuration
 PROXY_LIST_URL = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&protocol=http&timeout=150"
 REFRESH_INTERVAL = 300
-LISTEN_PORT = 8080
+MAX_RETRIES = 10
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -53,13 +53,17 @@ class ProxyManager:
         except Exception as e:
             logger.error(f"Error fetching proxies: {e}")
 
-    def get_proxy(self, auth_header: str) -> str:
+    def get_proxy(self, auth_header: str, attempt: int = 0) -> str:
         if not self.proxies:
             return None
-        h = hashlib.sha256(
+        # Jump to a different index based on the attempt number
+        base_h = hashlib.sha256(
             auth_header.encode() if auth_header else b"anonymous"
         ).hexdigest()
-        idx = int(h, 16) % len(self.proxies)
+        base_idx = int(base_h, 16)
+        idx = (base_idx + attempt * 7) % len(
+            self.proxies
+        )  # Use prime multiplier to jump around
         return self.proxies[idx]
 
 
@@ -69,7 +73,6 @@ proxy_manager = ProxyManager()
 async def handle_request(request):
     provider_key = request.match_info.get("provider")
     if provider_key not in PROVIDERS:
-        # Fallback to OpenRouter if no provider specified
         upstream_base = PROVIDERS["openrouter"]
         path = f"{provider_key}/{request.match_info.get('tail', '')}".strip("/")
     else:
@@ -81,44 +84,58 @@ async def handle_request(request):
         target_url += f"?{request.query_string}"
 
     auth_header = request.headers.get("Authorization", "")
-    proxy_url = proxy_manager.get_proxy(auth_header)
-
-    logger.info(f"Forwarding to {target_url} via {proxy_url} [Auth: {auth_header}]")
+    body = await request.read()
 
     headers = {
         k: v
         for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
+        if k.lower() not in ("host", "content-length", "expect")
     }
 
-    try:
-        # Use a long timeout for LLM calls
-        timeout = aiohttp.ClientTimeout(total=300)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Read body
-            body = await request.read()
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        proxy_url = proxy_manager.get_proxy(auth_header, attempt)
+        if not proxy_url:
+            return web.Response(text="No proxies available", status=503)
 
-            async with session.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                data=body,
-                proxy=proxy_url,
-                allow_redirects=True,
-            ) as resp:
-                response_body = await resp.read()
-                return web.Response(
-                    body=response_body,
-                    status=resp.status,
-                    headers={
-                        k: v
-                        for k, v in resp.headers.items()
-                        if k.lower() not in ("transfer-encoding", "content-encoding")
-                    },
-                )
-    except Exception as e:
-        logger.error(f"Gateway error: {e}")
-        return web.Response(text=f"Gateway Error: {str(e)}", status=502)
+        logger.info(
+            f"Attempt {attempt + 1}/{MAX_RETRIES}: Forwarding to {target_url} via {proxy_url}"
+        )
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=60, connect=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=headers,
+                    data=body,
+                    proxy=proxy_url,
+                    allow_redirects=True,
+                ) as resp:
+                    response_body = await resp.read()
+                    logger.info(f"Success! Status: {resp.status} via {proxy_url}")
+                    return web.Response(
+                        body=response_body,
+                        status=resp.status,
+                        headers={
+                            k: v
+                            for k, v in resp.headers.items()
+                            if k.lower()
+                            not in ("transfer-encoding", "content-encoding")
+                        },
+                    )
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Attempt {attempt + 1} failed via {proxy_url}: {str(e)}")
+            continue
+
+    logger.error(
+        f"All {MAX_RETRIES} attempts failed for {target_url}. Last error: {last_error}"
+    )
+    return web.Response(
+        text=f"Gateway Error after {MAX_RETRIES} retries: {str(last_error)}", status=502
+    )
 
 
 async def refresh_loop():
@@ -143,7 +160,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
-    logger.info("Reverse Proxy Gateway running on port 8080")
+    logger.info("Resilient Reverse Proxy Gateway running on port 8080")
 
     while True:
         await asyncio.sleep(3600)
