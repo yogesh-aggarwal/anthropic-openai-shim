@@ -46,5 +46,14 @@ services:
       ANTHROPIC_PROXY_API_KEY: ${LITELLM_MASTER_KEY}
     restart: unless-stopped
 
+  proxy-rotator:
+    build:
+      context: ./proxy_rotator
+      dockerfile: Dockerfile
+    container_name: proxy-rotator
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+
 volumes:
   litellm_postgres_data:
