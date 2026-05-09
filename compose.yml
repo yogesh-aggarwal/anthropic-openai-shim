@@ -11,8 +11,8 @@ services:
     restart: unless-stopped
 
   litellm:
-    image: ghcr.io/berriai/litellm:main-stable
-    platform: ${LITELLM_PLATFORM:-linux/amd64}
+    image: litellm/litellm:latest
+    platform: linux/amd64
     container_name: litellm-proxy
     depends_on:
       - postgres

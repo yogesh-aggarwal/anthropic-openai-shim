@@ -10,3 +10,4 @@ litellm_settings:
   retry_after: 1
   allowed_fails: 1
   cooldown_time: 60
+  proxy: http://proxy-rotator:8080
