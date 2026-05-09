@@ -241,8 +241,8 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
     for model in all_openrouter_models:
         model_id = model["id"]
         if is_model_free(model, model_id):
-            standardized = standardize_model_id(openrouter_prefix, model_id)
-            openrouter_matched.append(f"{openrouter_prefix}/{standardized}")
+            # Prefix with openrouter/ for litellm model ID
+            openrouter_matched.append(f"openrouter/{model_id}")
 
     if openrouter_matched:
         results["openrouter"] = {
@@ -280,8 +280,8 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
         for model in provider_models:
             model_id = model["id"]
             if is_model_free(model, model_id):
-                standardized = standardize_model_id(prefix, model_id)
-                matched.append(f"{prefix}/{standardized}")
+                # Prefix with provider prefix for litellm model ID
+                matched.append(f"{prefix}/{model_id}")
 
         if matched:
             result = {
