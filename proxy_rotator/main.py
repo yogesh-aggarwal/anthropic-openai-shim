@@ -2,7 +2,6 @@ import asyncio
 import logging
 import random
 import time
-from typing import Dict, List
 
 import aiohttp
 from aiohttp import web
@@ -37,7 +36,6 @@ class ProxyStats:
     def record_success(self, latency: float):
         self.total_calls += 1
         self.score = min(200, self.score + SUCCESS_REWARD)
-        # EMA for latency (alpha=0.3)
         if self.avg_latency == 0:
             self.avg_latency = latency
         else:
@@ -51,7 +49,7 @@ class ProxyStats:
 
 class ProxyManager:
     def __init__(self):
-        self.proxies: Dict[str, ProxyStats] = {}
+        self.proxies: dict[str, ProxyStats] = {}
         self.last_fetch = 0
 
     async def fetch_proxies(self):
@@ -72,17 +70,12 @@ class ProxyManager:
                             new_urls.append(p)
 
                     if new_urls:
-                        # Keep stats for existing proxies, add new ones
-                        current_urls = set(self.proxies.keys())
                         for url in new_urls:
                             if url not in self.proxies:
                                 self.proxies[url] = ProxyStats(url)
-
-                        # Cleanup dead proxies (not in newest list)
                         for url in list(self.proxies.keys()):
                             if url not in new_urls:
                                 del self.proxies[url]
-
                         self.last_fetch = time.time()
                         logger.info(
                             f"Successfully loaded {len(self.proxies)} proxies. Stats preserved."
@@ -95,21 +88,14 @@ class ProxyManager:
     def get_proxy(self, auth_header: str, attempt: int = 0) -> str:
         if not self.proxies:
             return None
-
-        # Sort proxies by score (desc) and then latency (asc)
-        # Proxies with score 0 are relegated to the very end
         sorted_proxies = sorted(
             self.proxies.values(),
             key=lambda p: (p.score, -p.avg_latency if p.avg_latency > 0 else -999),
             reverse=True,
         )
-
-        # On first few attempts, try the cream of the crop
-        # On later attempts, add some randomness to explore other potential proxies
         if attempt < 3:
             return sorted_proxies[attempt % len(sorted_proxies)].url
         else:
-            # Pick from the top 50% randomly to avoid hammering the same "good" but slow proxies
             top_half = sorted_proxies[: max(1, len(sorted_proxies) // 2)]
             return random.choice(top_half).url
 
@@ -153,12 +139,12 @@ async def handle_request(request):
             return web.Response(text="No proxies available", status=503)
 
         logger.info(
-            f"Attempt {attempt + 1}/{MAX_RETRIES}: Using {proxy_url} (Score: {proxy_manager.proxies[proxy_url].score}) for {target_url}"
+            f"Attempt {attempt + 1}/{MAX_RETRIES}: Forwarding to {target_url} via {proxy_url}"
         )
 
         start_time = time.time()
         try:
-            timeout = aiohttp.ClientTimeout(total=60, connect=10)
+            timeout = aiohttp.ClientTimeout(total=300, connect=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.request(
                     method=request.method,
@@ -168,33 +154,42 @@ async def handle_request(request):
                     proxy=proxy_url,
                     allow_redirects=True,
                 ) as resp:
-                    response_body = await resp.read()
-                    latency = time.time() - start_time
-
-                    # If we got a response from the actual provider, it's a success for the proxy
-                    # 401, 404, etc. from OpenRouter mean the proxy WORKED.
-                    # 502, 503, 504 usually mean the PROXY failed.
-                    if resp.status < 500 and resp.status != 407:
-                        proxy_manager.report_outcome(proxy_url, True, latency)
-                        logger.info(
-                            f"SUCCESS! {resp.status} via {proxy_url} in {latency:.2f}s"
+                    # Definitive outcomes (Success or definitive client error)
+                    if (resp.status < 400) or (resp.status in (401, 404)):
+                        proxy_manager.report_outcome(
+                            proxy_url, True, time.time() - start_time
                         )
-                    else:
-                        proxy_manager.report_outcome(proxy_url, False)
-                        logger.warning(f"Upstream error {resp.status} via {proxy_url}")
 
-                    return web.Response(
-                        body=response_body,
-                        status=resp.status,
-                        headers={
-                            k: v
-                            for k, v in resp.headers.items()
-                            if k.lower()
-                            not in ("transfer-encoding", "content-encoding")
-                        },
+                        # Initialize streaming response
+                        stream_resp = web.StreamResponse(
+                            status=resp.status,
+                            headers={
+                                k: v
+                                for k, v in resp.headers.items()
+                                if k.lower()
+                                not in (
+                                    "transfer-encoding",
+                                    "content-encoding",
+                                    "content-length",
+                                )
+                            },
+                        )
+                        await stream_resp.prepare(request)
+
+                        # Pipe data chunk-by-chunk
+                        async for chunk in resp.content.iter_chunked(8192):
+                            await stream_resp.write(chunk)
+
+                        await stream_resp.write_eof()
+                        return stream_resp
+
+                    # Retriable outcomes
+                    proxy_manager.report_outcome(proxy_url, False)
+                    logger.warning(
+                        f"Retriable error {resp.status} via {proxy_url}. Trying next..."
                     )
+                    continue
         except Exception as e:
-            latency = time.time() - start_time
             last_error = e
             proxy_manager.report_outcome(proxy_url, False)
             logger.warning(f"Attempt {attempt + 1} FAILED via {proxy_url}: {str(e)}")
@@ -230,7 +225,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
-    logger.info("Intelligent Reputation-Based Gateway running on port 8080")
+    logger.info("Streaming Reputation-Based Gateway running on port 8080")
 
     while True:
         await asyncio.sleep(3600)
