@@ -12,7 +12,7 @@ services:
 
   litellm:
     image: litellm/litellm:1.85.0-dev.1
-    platform: ${LITELLM_PLATFORM:-linux/amd64}
+    # platform: ${LITELLM_PLATFORM:-linux/amd64}
     container_name: litellm-proxy
     depends_on:
       - postgres
