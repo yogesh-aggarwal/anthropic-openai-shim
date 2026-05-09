@@ -54,6 +54,9 @@ services:
     ports:
       - "8081:8080"
     restart: unless-stopped
+    volumes:
+      - ./proxy_rotator:/app
+      - ./PROXIES.TXT:/PROXIES.TXT
 
 volumes:
   litellm_postgres_data:
