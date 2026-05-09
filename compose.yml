@@ -21,6 +21,9 @@ services:
     environment:
       DATABASE_URL: postgresql://litellm:litellm@postgres:5432/litellm
       STORE_MODEL_IN_DB: "True"
+      HTTP_PROXY: http://proxy-rotator:8080
+      HTTPS_PROXY: http://proxy-rotator:8080
+      NO_PROXY: postgres,localhost,127.0.0.1
     ports:
       - "8080:4000"
     volumes:

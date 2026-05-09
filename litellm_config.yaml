@@ -10,4 +10,4 @@ litellm_settings:
   retry_after: 1
   allowed_fails: 1
   cooldown_time: 60
-  proxy: http://proxy-rotator:8080
+  # Global proxy is now handled via environment variables in compose.yml
