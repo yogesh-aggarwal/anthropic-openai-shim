@@ -10,7 +10,7 @@ import random
 
 # Configuration
 # Check both /app (local dev) and / (Docker mount)
-PROXY_FILES = ["PROXIES.TXT", "/PROXIES.TXT"]
+PROXY_FILES = ["PROXIES.txt", "/PROXIES.txt"]
 PROXY_LIST_URL = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&protocol=http&timeout=150"
 REFRESH_INTERVAL = 300
 MAX_RETRIES = 10

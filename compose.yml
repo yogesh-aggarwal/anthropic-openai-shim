@@ -56,7 +56,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./proxy_rotator:/app
-      - ./PROXIES.TXT:/PROXIES.TXT
+      - ./PROXIES.txt:/PROXIES.txt
 
 volumes:
   litellm_postgres_data:
