@@ -4,9 +4,9 @@ import time
 import logging
 import aiohttp
 import os
-from aiohttp import web
-from typing import Dict, List
 import random
+import socket
+from typing import Dict, List, Optional
 
 # Configuration
 # Check both /app (local dev) and / (Docker mount)
@@ -22,11 +22,6 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("proxy-rotator")
-
-PROVIDERS = {
-    "openrouter": "https://openrouter.ai/api/v1",
-    "kilo": "https://api.kilo.ai/api/gateway",
-}
 
 class ProxyStats:
     def __init__(self, url: str, source: str = "url"):
@@ -153,97 +148,147 @@ class ProxyManager:
 
 proxy_manager = ProxyManager()
 
-async def handle_request(request):
-    provider_key = request.match_info.get("provider")
-    if provider_key not in PROVIDERS:
-        upstream_base = PROVIDERS["openrouter"]
-        path = f"{provider_key}/{request.match_info.get('tail', '')}".strip("/")
-    else:
-        upstream_base = PROVIDERS[provider_key]
-        path = request.match_info.get("tail", "").strip("/")
-
-    target_url = f"{upstream_base}/{path}"
-    if request.query_string:
-        target_url += f"?{request.query_string}"
-
-    auth_header = request.headers.get("Authorization", "")
-    body = await request.read()
-    
-    headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length", "expect")
-    }
-
-    last_error = None
-    for attempt in range(MAX_RETRIES):
-        proxy_url = proxy_manager.get_proxy(auth_header, attempt)
-        if not proxy_url:
-            return web.Response(text="No proxies available", status=503)
-
-        logger.info(f"Attempt {attempt+1}/{MAX_RETRIES}: Forwarding to {target_url} via {proxy_url} ({proxy_manager.proxies[proxy_url].source})")
-
-        start_time = time.time()
-        try:
-            timeout = aiohttp.ClientTimeout(total=300, connect=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.request(
-                    method=request.method,
-                    url=target_url,
-                    headers=headers,
-                    data=body,
-                    proxy=proxy_url,
-                    allow_redirects=True,
-                ) as resp:
-                    if (resp.status < 400) or (resp.status in (401, 404)):
-                        proxy_manager.report_outcome(proxy_url, True, time.time() - start_time)
-                        stream_resp = web.StreamResponse(
-                            status=resp.status,
-                            headers={
-                                k: v
-                                for k, v in resp.headers.items()
-                                if k.lower() not in ("transfer-encoding", "content-encoding", "content-length")
-                            }
-                        )
-                        await stream_resp.prepare(request)
-                        async for chunk in resp.content.iter_chunked(16384):
-                            await stream_resp.write(chunk)
-                        await stream_resp.write_eof()
-                        return stream_resp
-                    
-                    proxy_manager.report_outcome(proxy_url, False)
-                    logger.warning(f"Retriable error {resp.status} via {proxy_url}. Trying next...")
-                    continue
-        except Exception as e:
-            last_error = e
-            proxy_manager.report_outcome(proxy_url, False)
-            logger.warning(f"Attempt {attempt+1} FAILED via {proxy_url}: {str(e)}")
-            continue
-
-    logger.error(f"FATAL: All {MAX_RETRIES} attempts failed. Last error: {last_error}")
-    return web.Response(text=f"Gateway Error after {MAX_RETRIES} retries: {str(last_error)}", status=502)
-
 async def refresh_loop():
     while True:
         await asyncio.sleep(REFRESH_INTERVAL)
         await proxy_manager.fetch_proxies()
 
+async def relay_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        while True:
+            data = await reader.read(16384)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+async def handle_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        # Read the CONNECT request header
+        header_data = b""
+        while True:
+            line = await reader.readline()
+            if not line or line == b"\r\n":
+                break
+            header_data += line
+        
+        if not header_data:
+            writer.close()
+            return
+
+        header_str = header_data.decode("utf-8")
+        lines = header_str.split("\r\n")
+        if not lines or not lines[0].startswith("CONNECT"):
+            writer.close()
+            return
+
+        parts = lines[0].split(" ")
+        if len(parts) < 2:
+            writer.close()
+            return
+            
+        target_addr = parts[1] # e.g. "openrouter.ai:443"
+        host, port = target_addr.split(":")
+        port = int(port)
+
+        # Get a proxy to use
+        # For simplicity in this TCP relay, we don't have the full headers here for user targeting
+        proxy_url = proxy_manager.get_proxy("", 0)
+        if not proxy_url:
+            writer.write(b"HTTP/1.1 503 No Proxies Available\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            return
+
+        logger.info(f"CONNECT {target_addr} via {proxy_url}")
+
+        # Connect to the external proxy and send our CONNECT request to it
+        from urllib.parse import urlparse
+        p = urlparse(proxy_url)
+        
+        try:
+            proxy_reader, proxy_writer = await asyncio.open_connection(p.hostname, p.port)
+            
+            # If the outgoing proxy has auth
+            auth_header = ""
+            if p.username and p.password:
+                import base64
+                auth = base64.b64encode(f"{p.username}:{p.password}".encode()).decode()
+                auth_header = f"Proxy-Authorization: Basic {auth}\r\n"
+
+            proxy_writer.write(f"CONNECT {target_addr} HTTP/1.1\r\n{auth_header}\r\n".encode())
+            await proxy_writer.drain()
+
+            # Read response from proxy
+            resp = await proxy_reader.readline()
+            if b"200" not in resp:
+                logger.warning(f"Upstream proxy {proxy_url} rejected CONNECT: {resp.decode().strip()}")
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await writer.drain()
+                proxy_writer.close()
+                writer.close()
+                return
+
+            # Skip remaining upstream headers
+            while True:
+                line = await proxy_reader.readline()
+                if line == b"\r\n":
+                    break
+
+            # Signal success to the client
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+
+            # Relay bidirectional traffic
+            await asyncio.gather(
+                relay_stream(reader, proxy_writer),
+                relay_stream(proxy_reader, writer)
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to upstream proxy {proxy_url}: {e}")
+            writer.write(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+            await writer.drain()
+            writer.close()
+
+    except Exception as e:
+        logger.error(f"Error in handle_connect: {e}")
+        try:
+            writer.close()
+        except:
+            pass
+
+async def handle_request_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    # Support for regular GET/POST/etc if LiteLLM sends them (non-CONNECT)
+    # For now, let's focus on CONNECT as it's what we see in logs.
+    # To keep it simple, we'll just log and close if it's not CONNECT
+    data = await reader.read(8192)
+    if not data:
+        writer.close()
+        return
+
+    if data.startswith(b"CONNECT"):
+        # Put data back or just parse it here?
+        # aiohttp is better for HTTP, but we need TCP for CONNECT.
+        # Let's simplify: this proxy will ONLY support CONNECT for now.
+        pass
+
 async def main():
     await proxy_manager.fetch_proxies()
     asyncio.create_task(refresh_loop())
 
-    app = web.Application()
-    app.add_routes([
-        web.route("*", "/{provider}/{tail:.*}", handle_request),
-        web.route("*", "/{provider}", handle_request),
-    ])
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
-    logger.info("Priority-Aware Gateway running on port 8080")
-    while True: await asyncio.sleep(3600)
+    server = await asyncio.start_server(handle_connect, "0.0.0.0", 8080)
+    logger.info("TCP-based Proxy Rotator running on port 8080 (Supports CONNECT)")
+    async with server:
+        await server.serve_forever()
 
 if __name__ == "__main__":
     asyncio.run(main())
