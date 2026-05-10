@@ -9,12 +9,13 @@ Pipeline:
 5. Convert models.config.yaml to models.yaml with OpenRouter metadata enrichment
 """
 
-import httpx
 import itertools
-import yaml
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+import httpx
+import yaml
 from rich.console import Console
 from rich.live import Live
 from rich.text import Text
@@ -64,7 +65,7 @@ def standardize_model_id(provider_prefix: str, model_id: str) -> str:
 
     # Remove provider prefix if present
     if result.startswith(f"{provider_prefix}/"):
-        result = result[len(provider_prefix) + 1:]
+        result = result[len(provider_prefix) + 1 :]
 
     # Extract the slug part before any colons
     result = result.split(":", 1)[0]
@@ -104,7 +105,7 @@ def generate_model_display_name(model_id: str) -> str:
         else:
             result_words.append(word.capitalize())
 
-    final =  " ".join(result_words)
+    final = " ".join(result_words)
     if final.endswith(" IT"):
         final = final.rpartition(" IT")[0]
     return final
@@ -200,10 +201,7 @@ def is_model_free(model: dict, model_id: str) -> bool:
         return True
 
     # Check if pricing is explicitly 0 for both prompt and completion
-    if (
-        pricing.get("prompt") == "0"
-        and pricing.get("completion") == "0"
-    ):
+    if pricing.get("prompt") == "0" and pricing.get("completion") == "0":
         return True
 
     return False
@@ -229,7 +227,9 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
             continue
 
     all_openrouter_models = list(openrouter_models_by_id.values())
-    console.print(f"  [green]Found {len(all_openrouter_models)} total OpenRouter models[/]")
+    console.print(
+        f"  [green]Found {len(all_openrouter_models)} total OpenRouter models[/]"
+    )
 
     # Build OpenRouter lookup using standardized names
     or_lookup = build_openrouter_lookup(all_openrouter_models)
@@ -259,7 +259,11 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
         prefix = info.get("prefix", provider_name)
 
         if explicit_models:
-            return provider_name, info, len(explicit_models) if isinstance(explicit_models, list) else 0
+            return (
+                provider_name,
+                info,
+                len(explicit_models) if isinstance(explicit_models, list) else 0,
+            )
 
         if not base or not keys:
             console.print(f"[yellow]Skipping {provider_name}: no base or keys[/]")
@@ -345,7 +349,9 @@ def discover_free_models(providers: dict) -> tuple[dict, dict]:
     return results, or_lookup
 
 
-def convert_models(config: dict, or_lookup: dict, output_path: str, name_overrides: dict | None = None) -> None:
+def convert_models(
+    config: dict, or_lookup: dict, output_path: str, name_overrides: dict | None = None
+) -> None:
     """Convert models.config dict to models.yaml format with OpenRouter metadata."""
     if name_overrides is None:
         name_overrides = {}
@@ -364,74 +370,62 @@ def convert_models(config: dict, or_lookup: dict, output_path: str, name_overrid
     model_list = []
 
     for unique_id, items in grouped.items():
-        primary_model, primary_base, primary_key = items[0]
-        fallbacks = items[1:]
+        for model, api_base, api_key in items:
+            litellm_params = {
+                "model": model,
+                "api_base": api_base,
+                "api_key": api_key,
+            }
 
-        litellm_params = {
-            "model": primary_model,
-            "api_base": primary_base,
-            "api_key": primary_key,
-        }
+            model_info: dict = {}
 
-        if fallbacks:
-            litellm_params["fallbacks"] = [
-                {
-                    "model": m,
-                    "api_base": b,
-                    "api_key": k,
-                }
-                for m, b, k in fallbacks
-            ]
+            # Enrich with OpenRouter metadata if available
+            if unique_id in or_lookup:
+                or_data = or_lookup[unique_id]
+                skip_keys = {"id", "pricing"}
+                for key, value in or_data.items():
+                    if key in skip_keys or value is None:
+                        continue
+                    if key == "architecture":
+                        arch = value
+                        for ak, av in arch.items():
+                            if av is not None:
+                                model_info[f"arch_{ak}"] = av
+                    elif key == "top_provider":
+                        tp = value
+                        for tk, tv in tp.items():
+                            if tv is not None:
+                                model_info[f"top_provider_{tk}"] = tv
+                    elif key == "default_parameters":
+                        dp = value
+                        for dk, dv in dp.items():
+                            if dv is not None:
+                                model_info[f"default_param_{dk}"] = dv
+                    elif key == "per_request_limits":
+                        if value:
+                            model_info["per_request_limits"] = value
+                    else:
+                        model_info[key] = value
 
-        model_info: dict = {}
+                model_info["mode"] = "chat"
+                model_info["supports_vision"] = "image" in or_data.get(
+                    "architecture", {}
+                ).get("input_modalities", [])
 
-        # Enrich with OpenRouter metadata if available
-        if unique_id in or_lookup:
-            or_data = or_lookup[unique_id]
-            skip_keys = {"id", "pricing"}
-            for key, value in or_data.items():
-                if key in skip_keys or value is None:
-                    continue
-                if key == "architecture":
-                    arch = value
-                    for ak, av in arch.items():
-                        if av is not None:
-                            model_info[f"arch_{ak}"] = av
-                elif key == "top_provider":
-                    tp = value
-                    for tk, tv in tp.items():
-                        if tv is not None:
-                            model_info[f"top_provider_{tk}"] = tv
-                elif key == "default_parameters":
-                    dp = value
-                    for dk, dv in dp.items():
-                        if dv is not None:
-                            model_info[f"default_param_{dk}"] = dv
-                elif key == "per_request_limits":
-                    if value:
-                        model_info["per_request_limits"] = value
-                else:
-                    model_info[key] = value
+            model_info["input_cost_per_token"] = CostValue(0.000003)
+            model_info["output_cost_per_token"] = CostValue(0.000015)
 
-            model_info["mode"] = "chat"
-            model_info["supports_vision"] = "image" in or_data.get(
-                "architecture", {}
-            ).get("input_modalities", [])
+            if unique_id in name_overrides:
+                model_info["name"] = name_overrides[unique_id]
+            else:
+                model_info["name"] = generate_model_display_name(unique_id)
 
-        model_info["input_cost_per_token"] = CostValue(0.000003)
-        model_info["output_cost_per_token"] = CostValue(0.000015)
-
-        if unique_id in name_overrides:
-            model_info["name"] = name_overrides[unique_id]
-        else:
-            model_info["name"] = generate_model_display_name(unique_id)
-
-        model_entry = {
-            "model_name": unique_id,
-            "litellm_params": litellm_params,
-            "model_info": model_info,
-        }
-        model_list.append(model_entry)
+            model_entry = {
+                "model_name": unique_id,
+                "litellm_params": litellm_params,
+                "model_info": model_info,
+            }
+            model_list.append(model_entry)
 
     output = {"model_list": model_list}
 
@@ -464,7 +458,9 @@ def main() -> None:
     with open(config_file, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
-    console.print(f"\n[bold green]Wrote models.config.yaml with {len(config)} providers[/]")
+    console.print(
+        f"\n[bold green]Wrote models.config.yaml with {len(config)} providers[/]"
+    )
 
     convert_models(config, or_lookup, str(output_file), name_overrides)
     console.print("[bold green]Converted models ✌️[/]")
