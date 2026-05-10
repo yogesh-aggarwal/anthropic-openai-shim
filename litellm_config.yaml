@@ -6,8 +6,3 @@ general_settings:
 
 litellm_settings:
   drop_params: true
-  num_retries: 2
-  retry_after: 1
-  allowed_fails: 1
-  cooldown_time: 60
-  # Global proxy is now handled via environment variables in compose.yml
