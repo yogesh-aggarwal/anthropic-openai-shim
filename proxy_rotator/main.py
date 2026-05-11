@@ -42,13 +42,23 @@ class ProxyStats:
     def record_failure(self):
         self.total_calls += 1
         self.failures += 1
+        # Faster penalty: a proxy that fails twice in a row should be mostly out of rotation
         self.score = max(0, self.score - FAILURE_PENALTY)
+
+    def periodic_recovery(self):
+        # Slowly recover score over time to allow retrying dead proxies
+        if self.score < INITIAL_SCORE:
+            self.score = min(INITIAL_SCORE, self.score + 5)
 
 
 class ProxyManager:
     def __init__(self):
         self.proxies: dict[str, ProxyStats] = {}
         self.last_fetch = 0
+
+    def recover_all(self):
+        for p in self.proxies.values():
+            p.periodic_recovery()
 
     async def fetch_proxies(self):
         try:
@@ -124,12 +134,18 @@ class ProxyManager:
         if not self.proxies:
             return None
 
+        # Filter out proxies with score 0
+        available_proxies = [p for p in self.proxies.values() if p.score > 0]
+        if not available_proxies:
+            # If all are drained/failed, use all but reset them partially or just pick from all
+            available_proxies = list(self.proxies.values())
+
         # Priority Logic:
         # 1. Source (File > URL)
         # 2. Score (High > Low)
         # 3. Latency (Low > High)
         sorted_proxies = sorted(
-            self.proxies.values(),
+            available_proxies,
             key=lambda p: (
                 p.source == "file",  # True (1) > False (0)
                 p.score,
@@ -138,13 +154,15 @@ class ProxyManager:
             reverse=True,
         )
 
-        # On early attempts, respect the sorting strictly
-        if attempt < 3:
-            return sorted_proxies[attempt % len(sorted_proxies)].url
-        else:
-            # On retries, pick from the top 30% randomly to ensure coverage
-            sample_size = max(1, int(len(sorted_proxies) * 0.3))
-            return random.choice(sorted_proxies[:sample_size]).url
+        # Shuffle top tier slightly to avoid stampede on one proxy
+        top_tier_size = max(1, len(sorted_proxies) // 5)
+        # Ensure we always have at least a few to pick from if the pool is small
+        top_tier_size = max(top_tier_size, min(3, len(sorted_proxies)))
+        top_tier = sorted_proxies[:top_tier_size]
+        
+        selected = random.choice(top_tier)
+        logger.debug(f"Selected proxy {selected.url} (Score: {selected.score})")
+        return selected.url
 
     def report_outcome(self, url: str, success: bool, latency: float = 0):
         if url in self.proxies:
@@ -161,6 +179,8 @@ async def refresh_loop():
     while True:
         await asyncio.sleep(REFRESH_INTERVAL)
         await proxy_manager.fetch_proxies()
+        # Also recover scores periodically
+        proxy_manager.recover_all()
 
 
 async def relay_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -207,8 +227,12 @@ async def handle_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             return
 
         target_addr = parts[1]  # e.g. "openrouter.ai:443"
-        host, port = target_addr.split(":")
-        port = int(port)
+        try:
+            host, port_str = target_addr.split(":")
+            port = int(port_str)
+        except ValueError:
+            host = target_addr
+            port = 443
 
         # Get a proxy to use
         # For simplicity in this TCP relay, we don't have the full headers here for user targeting
@@ -227,8 +251,9 @@ async def handle_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         p = urlparse(proxy_url)
 
         try:
-            proxy_reader, proxy_writer = await asyncio.open_connection(
-                p.hostname, p.port
+            # Use a timeout for the upstream connection
+            proxy_reader, proxy_writer = await asyncio.wait_for(
+                asyncio.open_connection(p.hostname, p.port), timeout=10.0
             )
 
             # If the outgoing proxy has auth
@@ -240,16 +265,27 @@ async def handle_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 auth_header = f"Proxy-Authorization: Basic {auth}\r\n"
 
             proxy_writer.write(
-                f"CONNECT {target_addr} HTTP/1.1\r\n{auth_header}\r\n".encode()
+                f"CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n{auth_header}\r\n".encode()
             )
             await proxy_writer.drain()
 
-            # Read response from proxy
-            resp = await proxy_reader.readline()
+            # Read response from proxy (read until double CRLF or timeout)
+            try:
+                resp = await asyncio.wait_for(proxy_reader.readline(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout reading response from proxy {proxy_url}")
+                proxy_manager.report_outcome(proxy_url, False)
+                writer.write(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                proxy_writer.close()
+                return
+
             if b"200" not in resp:
                 logger.warning(
-                    f"Upstream proxy {proxy_url} rejected CONNECT: {resp.decode().strip()}"
+                    f"Upstream proxy {proxy_url} rejected CONNECT to {target_addr}: {resp.decode().strip()}"
                 )
+                proxy_manager.report_outcome(proxy_url, False)
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await writer.drain()
                 proxy_writer.close()
@@ -258,8 +294,8 @@ async def handle_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
             # Skip remaining upstream headers
             while True:
-                line = await proxy_reader.readline()
-                if line == b"\r\n":
+                line = await asyncio.wait_for(proxy_reader.readline(), timeout=2.0)
+                if line == b"\r\n" or not line:
                     break
 
             # Signal success to the client
@@ -267,15 +303,25 @@ async def handle_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             await writer.drain()
 
             # Relay bidirectional traffic
-            await asyncio.gather(
-                relay_stream(reader, proxy_writer), relay_stream(proxy_reader, writer)
-            )
+            start_time = time.time()
+            try:
+                await asyncio.gather(
+                    relay_stream(reader, proxy_writer), relay_stream(proxy_reader, writer)
+                )
+                proxy_manager.report_outcome(proxy_url, True, time.time() - start_time)
+            except Exception:
+                # One side closed or error occurred
+                pass
 
-        except Exception as e:
+        except (asyncio.TimeoutError, ConnectionRefusedError, Exception) as e:
             logger.error(f"Failed to connect to upstream proxy {proxy_url}: {e}")
+            proxy_manager.report_outcome(proxy_url, False)
             writer.write(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
             await writer.drain()
-            writer.close()
+            try:
+                writer.close()
+            except:
+                pass
 
     except Exception as e:
         logger.error(f"Error in handle_connect: {e}")
